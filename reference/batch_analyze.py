@@ -26,7 +26,7 @@ from cli.models import AnalystType
 from cli.utils import detect_asset_type, filter_analysts_for_asset_type
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.reporting import write_report_tree
+from tradingagents.reporting import extract_screen_summary, write_report_tree
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,11 +41,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Analysis date YYYY-MM-DD (default: today)",
     )
+    parser.add_argument(
+        "--horizon",
+        default="position",
+        choices=["swing", "position"],
+        help=(
+            "Trade horizon passed to every ticker's run: 'swing' (a quick trade, "
+            "a few days) or 'position' (a hold, multi-month trend). Default: position."
+        ),
+    )
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
-def analyze_one(ticker: str, trade_date: str, debug: bool) -> dict:
+def analyze_one(ticker: str, trade_date: str, debug: bool, horizon: str = "position") -> dict:
     asset_type = detect_asset_type(ticker)
     analysts = filter_analysts_for_asset_type(list(AnalystType), asset_type)
     config = DEFAULT_CONFIG.copy()
@@ -54,7 +63,10 @@ def analyze_one(ticker: str, trade_date: str, debug: bool) -> dict:
         debug=debug,
         config=config,
     )
-    final_state, decision = graph.propagate(ticker, trade_date, asset_type=asset_type.value)
+    final_state, decision = graph.propagate(
+        ticker, trade_date, asset_type=asset_type.value, horizon=horizon,
+    )
+    summary = extract_screen_summary(final_state)
 
     # Render the same consolidated markdown report the interactive CLI
     # writes to disk, so callers get more than the one-line decision
@@ -73,7 +85,12 @@ def analyze_one(ticker: str, trade_date: str, debug: bool) -> dict:
         "ticker": ticker,
         "date": trade_date,
         "asset_type": asset_type.value,
+        "horizon": horizon,
         "decision": decision,
+        "sentiment_band": summary["sentiment_band"],
+        "sentiment_score": summary["sentiment_score"],
+        "price_target": summary["price_target"],
+        "time_horizon": summary["time_horizon"],
         "report": report_markdown,
     }
 
@@ -89,7 +106,7 @@ def main() -> int:
     results = []
     for ticker in tickers:
         try:
-            results.append(analyze_one(ticker, trade_date, args.debug))
+            results.append(analyze_one(ticker, trade_date, args.debug, args.horizon))
         except Exception as exc:  # noqa: BLE001 - batch must not die on one bad ticker
             results.append(
                 {"ticker": ticker, "date": trade_date, "error": f"{type(exc).__name__}: {exc}"}

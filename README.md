@@ -121,7 +121,53 @@ Leave `tickers` out of the prompt to fall back to the watchlist (dashboard
 panel if you've saved one there, else `TRADINGAGENTS_WATCHLIST`), or name
 specific symbols in the cron prompt itself.
 
-## 6. Dashboard panel
+## 6. Screener — discover new candidates
+
+`tradingagents_analyze` (and the dashboard's Run buttons) require you to
+already know which tickers you care about. `tradingagents_screen` is for
+the opposite case — "find me something new":
+
+```
+tradingagents_screen(asset_classes=["stock", "crypto"], risk="medium", horizon="position", limit=10)
+```
+
+It runs in two stages:
+
+1. **Discovery** (cheap, no LLM) — filters a broad universe by risk level
+   and trade horizon:
+   - **stock** → Yahoo Finance's own screener (`yfinance`'s `yf.screen()`),
+     using beta as the risk proxy and short-term vs 52-week momentum for
+     swing vs hold.
+   - **crypto** → CoinGecko's public markets endpoint (no API key), using
+     market-cap rank as the risk proxy and 24h vs 7d change for swing vs
+     hold.
+   - **commodity** → a small static list of liquid futures (gold, oil,
+     copper, etc.), ranked by realized momentum over the matching window.
+2. **Deep dive** (existing pipeline) — runs the same TradingAgents
+   multi-agent analysis as `tradingagents_analyze` on the shortlist from
+   stage 1, so each result gets a sentiment and buy/sell/hold direction
+   alongside the screen metrics that surfaced it.
+
+`risk` is `low` / `medium` / `high`. `horizon` is `swing` (a quick trade,
+a few days) or `position` (a hold, multi-month trend). `limit` caps
+candidates *per asset class* before the deep dive — keep this small (5–15);
+each candidate costs a full multi-agent run in stage 2.
+
+**Two discovery paths, automatic fallback:**
+
+| Path | Requires | When it's used |
+|---|---|---|
+| Native (fast, in-process) | `yfinance` importable directly in Hermes's own Python environment (`pip install yfinance`) | Preferred whenever available |
+| Fallback (subprocess) | Same `TRADINGAGENTS_DIR`/`TRADINGAGENTS_EXEC_MODE` as `tradingagents_analyze`, plus `scripts/screen_candidates.py` copied into the checkout (see `reference/screen_candidates.py`, same as `batch_analyze.py` in step 1) | Used automatically when `yfinance` isn't importable in Hermes's environment — TradingAgents already depends on it, so this path works wherever TradingAgents itself runs |
+
+The dashboard's connectivity status card shows which path is active (and
+why, if neither is ready). No new required env vars — the fallback reuses
+`TRADINGAGENTS_DIR`/`TRADINGAGENTS_EXEC_MODE`/etc. from step 3.
+
+Results from a screen are also added to the dashboard's screen history and
+can be added to the watchlist individually (or all at once) from there.
+
+## 7. Dashboard panel
 
 The plugin ships a dashboard tab (`dashboard/`) — open `hermes dashboard`
 and you'll get a "TradingAgents" tab with:
@@ -141,6 +187,10 @@ and you'll get a "TradingAgents" tab with:
   "run all" — share one worker and execute strictly one at a time, so
   mashing the buttons queues work instead of firing overlapping
   docker/local invocations at once.
+- A **Screener** panel (see step 6): pick risk / asset class(es) / horizon,
+  run a screen, and add any result to the watchlist with one click (or all
+  of them at once). Shares the same worker queue as Run/Run all, so a
+  screen in flight and an analyze run don't race each other either.
 
 Every `tradingagents_analyze` call — cron-triggered, dashboard-triggered,
 or ad hoc from agent chat — writes its result here automatically; there's

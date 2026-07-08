@@ -65,7 +65,32 @@
     return SDK.fetchJSON(`${API}/run/status`);
   }
 
+  function postScreen(body) {
+    return SDK.fetchJSON(`${API}/screen`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function fetchScreenStatus() {
+    return SDK.fetchJSON(`${API}/screen/status`);
+  }
+
+  function fetchScreenHistory() {
+    return SDK.fetchJSON(`${API}/screen/history`);
+  }
+
+  function postWatchlistAdd(tickers) {
+    return SDK.fetchJSON(`${API}/watchlist/add`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tickers: tickers }),
+    });
+  }
+
   const RUN_POLL_INTERVAL_MS = 3000;
+  const ASSET_CLASSES = ["stock", "crypto", "commodity"];
 
   // Parse a textarea's free-form contents (newline- or comma-separated,
   // any mix of whitespace) into a clean, deduped, upper-cased ticker list.
@@ -113,6 +138,11 @@
         h(Button, { size: "sm", variant: "outline", onClick: props.onRefresh }, "Recheck"),
       ),
       h(CardContent, { className: "pt-0 text-xs text-muted-foreground" }, status.detail),
+      status.screener
+        ? h(CardContent, { className: "pt-0 text-xs text-muted-foreground" },
+            `Screener: ${status.screener.ready ? `ready (${status.screener.path})` : "not ready"} — ${status.screener.detail}`,
+          )
+        : null,
     );
   }
 
@@ -269,6 +299,200 @@
     );
   }
 
+  function ScreenResultRow(props) {
+    const row = props.row;
+    const [added, setAdded] = useState(false);
+    const [busy, setBusy] = useState(false);
+
+    function onAdd() {
+      setBusy(true);
+      postWatchlistAdd([row.ticker])
+        .then(function () {
+          setBusy(false);
+          setAdded(true);
+          props.onAdded();
+        })
+        .catch(function () { setBusy(false); });
+    }
+
+    const metrics = row.screen_metrics || {};
+    const metricsText = Object.keys(metrics)
+      .filter(function (k) { return metrics[k] !== null && metrics[k] !== undefined; })
+      .map(function (k) { return `${k}: ${metrics[k]}`; })
+      .join(", ");
+
+    return h("tr", { key: row.ticker },
+      h("td", null, h("span", { className: "font-medium" }, row.ticker)),
+      h("td", null, row.asset_type ? h(Badge, { variant: "secondary" }, row.asset_type) : null),
+      h("td", null,
+        row.error
+          ? h(Badge, { variant: "destructive", title: row.error }, "error")
+          : row.decision
+            ? h(Badge, { variant: decisionBadgeVariant(row.decision) }, String(row.decision).slice(0, 60))
+            : h("span", { className: "text-xs text-muted-foreground" }, "—"),
+      ),
+      h("td", null, h("span", { className: "text-xs text-muted-foreground", title: metricsText }, row.screen_source || "—")),
+      h("td", null,
+        added
+          ? h("span", { className: "text-xs text-muted-foreground" }, "Added")
+          : h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: onAdd }, busy ? "Adding…" : "+ Watchlist"),
+      ),
+    );
+  }
+
+  function ScreenResultsTable(props) {
+    if (!props.rows.length) {
+      return h("div", { className: "text-sm text-muted-foreground p-4" },
+        "No screen results yet. Pick a risk level, asset class(es), and horizon above, then run a screen."
+      );
+    }
+    return h("table", { className: "hermes-tradingagents-table" },
+      h("thead", null,
+        h("tr", null,
+          h("th", null, "Ticker"),
+          h("th", null, "Type"),
+          h("th", null, "Direction"),
+          h("th", null, "Screen source"),
+          h("th", null, "Add"),
+        ),
+      ),
+      h("tbody", null, props.rows.map(function (row) {
+        return h(ScreenResultRow, { key: row.ticker, row: row, onAdded: props.onAdded });
+      })),
+    );
+  }
+
+  function ScreenerPanel(props) {
+    const [assetClasses, setAssetClasses] = useState(["stock"]);
+    const [risk, setRisk] = useState("medium");
+    const [horizon, setHorizon] = useState("position");
+    const [limit, setLimit] = useState(10);
+    const [job, setJob] = useState(null); // { id, status }
+    const [results, setResults] = useState([]);
+    const [err, setErr] = useState(null);
+
+    function toggleAssetClass(cls) {
+      setAssetClasses(function (prev) {
+        if (prev.indexOf(cls) !== -1) {
+          return prev.filter(function (c) { return c !== cls; });
+        }
+        return prev.concat([cls]);
+      });
+    }
+
+    function onRunScreen() {
+      setErr(null);
+      postScreen({ asset_classes: assetClasses, risk: risk, horizon: horizon, limit: Number(limit) || 10 })
+        .then(function (result) {
+          setJob({ id: result.job.id, status: result.job.status });
+        })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); });
+    }
+
+    // Sync with the server's screen-job registry once on mount, same reason
+    // as TradingAgentsPanel's analogous effect: a page refresh mid-screen
+    // would otherwise show "Run screen" as clickable again even though the
+    // worker is still busy with a screen from before the refresh.
+    useEffect(function () {
+      fetchScreenStatus()
+        .then(function (result) {
+          const active = (result.jobs || []).find(function (j) {
+            return j.status === "queued" || j.status === "running";
+          });
+          if (active) {
+            setJob({ id: active.id, status: active.status });
+          }
+        })
+        .catch(function () { /* best-effort */ });
+    }, []);
+
+    useEffect(function () {
+      if (!job || job.status === "done" || job.status === "error") {
+        return undefined;
+      }
+      let cancelled = false;
+      const interval = setInterval(function () {
+        fetchScreenStatus()
+          .then(function (result) {
+            if (cancelled) return;
+            const found = (result.jobs || []).find(function (j) { return j.id === job.id; });
+            if (!found) return;
+            if (found.status === "done") {
+              setJob({ id: found.id, status: "done" });
+              setResults((found.result && found.result.results) || []);
+            } else if (found.status === "error") {
+              setJob({ id: found.id, status: "error" });
+              setErr(found.error);
+            } else {
+              setJob({ id: found.id, status: found.status });
+            }
+          })
+          .catch(function () { /* transient poll failure — try again next tick */ });
+      }, RUN_POLL_INTERVAL_MS);
+      return function () { cancelled = true; clearInterval(interval); };
+    }, [job]);
+
+    const running = !!job && (job.status === "queued" || job.status === "running");
+
+    return h(Card, null,
+      h(CardHeader, null, h(CardTitle, null, "Screener — find new candidates")),
+      h(CardContent, { className: "flex flex-col gap-3" },
+        h("p", { className: "text-xs text-muted-foreground" },
+          "Cheap quantitative discovery (Yahoo Finance screener for stocks, CoinGecko for " +
+          "crypto, a static futures list for commodities), then a TradingAgents deep-dive " +
+          "on the shortlist for sentiment and direction."
+        ),
+        h("div", { className: "flex flex-wrap items-end gap-4" },
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, null, "Asset classes"),
+            h("div", { className: "flex gap-3" },
+              ASSET_CLASSES.map(function (cls) {
+                return h("label", { key: cls, className: "flex items-center gap-1 text-sm" },
+                  h("input", {
+                    type: "checkbox",
+                    checked: assetClasses.indexOf(cls) !== -1,
+                    onChange: function () { toggleAssetClass(cls); },
+                  }),
+                  cls,
+                );
+              }),
+            ),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, null, "Risk"),
+            h("select", { value: risk, onChange: function (e) { setRisk(e.target.value); } },
+              h("option", { value: "low" }, "Low"),
+              h("option", { value: "medium" }, "Medium"),
+              h("option", { value: "high" }, "High"),
+            ),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, null, "Horizon"),
+            h("select", { value: horizon, onChange: function (e) { setHorizon(e.target.value); } },
+              h("option", { value: "swing" }, "Swing (a few days)"),
+              h("option", { value: "position" }, "Hold (6 months)"),
+            ),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, null, "Limit / class"),
+            h("input", {
+              type: "number", min: 1, max: 50, value: limit,
+              onChange: function (e) { setLimit(e.target.value); },
+              style: { width: "5rem" },
+            }),
+          ),
+          h(Button, {
+            size: "sm",
+            disabled: running || !assetClasses.length,
+            onClick: onRunScreen,
+          }, running ? (job.status === "queued" ? "Queued…" : "Running…") : "Run screen"),
+        ),
+        err ? h("div", { className: "text-sm text-destructive" }, err) : null,
+        h(ScreenResultsTable, { rows: results, onAdded: props.onWatchlistChanged }),
+      ),
+    );
+  }
+
   function TradingAgentsPanel() {
     const [status, setStatus] = useState(null);
     const [tickers, setTickers] = useState([]);
@@ -300,6 +524,28 @@
     }, []);
 
     useEffect(function () { load(); }, [load]);
+
+    // Sync with the server's job registry once on mount — it's the source of
+    // truth for "is anything running" and survives a page refresh (it's kept
+    // in the dashboard backend process, not the browser), but this tab only
+    // learns about jobs it triggered itself unless it asks. Without this, a
+    // refresh mid-run shows every Run button as clickable again even though
+    // the worker is still busy with a job from before the refresh.
+    useEffect(function () {
+      fetchRunStatus()
+        .then(function (result) {
+          const active = {};
+          (result.jobs || []).forEach(function (j) {
+            if (j.status === "queued" || j.status === "running") {
+              active[j.id] = { tickers: j.tickers || [], isAll: !!j.is_all, status: j.status };
+            }
+          });
+          if (Object.keys(active).length) {
+            setJobs(function (prev) { return Object.assign({}, active, prev); });
+          }
+        })
+        .catch(function () { /* best-effort — polling below will retry once triggered locally */ });
+    }, []);
 
     // Poll /run/status while we're waiting on any job, and refresh
     // watchlist/history the moment one finishes so the table picks up the
@@ -351,6 +597,14 @@
       return map;
     }, [jobs]);
 
+    // Any job in flight — individual or "all" — disables Run all: the worker
+    // processes one job at a time, so queuing another just piles up behind
+    // whatever's already running, and graying the button makes that visible
+    // instead of inviting a confusing extra click.
+    const anyRunActive = useMemo(function () {
+      return Object.keys(jobs).length > 0;
+    }, [jobs]);
+
     const allRunActive = useMemo(function () {
       return Object.keys(jobs).some(function (id) { return jobs[id].isAll; });
     }, [jobs]);
@@ -384,8 +638,8 @@
           h(Button, {
             size: "sm",
             onClick: onRunAll,
-            disabled: allRunActive || !tickers.length,
-          }, allRunActive ? "Running all…" : "Run all (queued)"),
+            disabled: anyRunActive || !tickers.length,
+          }, allRunActive ? "Running all…" : anyRunActive ? "Analysis running…" : "Run all (queued)"),
           h(Button, { size: "sm", variant: "outline", onClick: load, disabled: loading },
             loading ? "Loading…" : "Refresh"),
         ),
@@ -397,6 +651,7 @@
           }, runErr)
         : null,
       h(StatusCard, { status: status, onRefresh: load }),
+      h(ScreenerPanel, { onWatchlistChanged: load }),
       h(WatchlistEditor, {
         tickers: tickers,
         onSaved: function (saved) { setTickers(saved); load(); },

@@ -18,8 +18,11 @@ from __future__ import annotations
 
 from .tool import (
     TRADINGAGENTS_ANALYZE_SCHEMA,
+    TRADINGAGENTS_SCREEN_SCHEMA,
+    _check_screener_available,
     _check_tradingagents_available,
     _handle_tradingagents_analyze,
+    _handle_tradingagents_screen,
 )
 
 
@@ -31,4 +34,12 @@ def register(ctx) -> None:
         handler=_handle_tradingagents_analyze,
         check_fn=_check_tradingagents_available,
         emoji="📈",
+    )
+    ctx.register_tool(
+        name="tradingagents_screen",
+        toolset="tradingagents",
+        schema=TRADINGAGENTS_SCREEN_SCHEMA,
+        handler=_handle_tradingagents_screen,
+        check_fn=_check_screener_available,
+        emoji="🔎",
     )

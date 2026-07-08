@@ -25,6 +25,7 @@ from hermes_constants import get_hermes_home
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-^=]{1,32}$")
 _MAX_HISTORY_ENTRIES = 2000
+_MAX_SCREEN_RUNS = 200
 
 # Guards read-modify-write of the JSON files against concurrent runs
 # (e.g. two tool calls in flight, or a tool call racing a dashboard edit).
@@ -97,6 +98,19 @@ def save_watchlist(tickers: list[str]) -> list[str]:
     return cleaned
 
 
+def add_to_watchlist(tickers: list[str]) -> list[str]:
+    """Merge `tickers` into the existing watchlist (dedup, preserve existing
+    order, append new ones) — used by the screener panel's "add to
+    watchlist" action, as opposed to save_watchlist's full-replace."""
+    existing = load_watchlist()
+    merged = list(existing)
+    for raw in tickers:
+        ticker = validate_ticker(str(raw))
+        if ticker not in merged:
+            merged.append(ticker)
+    return save_watchlist(merged)
+
+
 # ---------------------------------------------------------------------------
 # Reports (full markdown body per ticker+date)
 # ---------------------------------------------------------------------------
@@ -162,3 +176,34 @@ def latest_by_ticker() -> dict[str, dict[str, Any]]:
         if current is None or entry.get("created_at", 0) >= current.get("created_at", 0):
             latest[ticker] = entry
     return latest
+
+
+# ---------------------------------------------------------------------------
+# Screen runs (stage A discovery + stage B deep-dive, bundled per run) — used
+# by the dashboard's Screener panel to show past runs without re-screening.
+# ---------------------------------------------------------------------------
+
+def _screen_history_path() -> Path:
+    return base_dir() / "screen_history.json"
+
+
+def load_screen_history() -> list[dict[str, Any]]:
+    path = _screen_history_path()
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_screen_run(entry: dict[str, Any]) -> None:
+    entry = dict(entry)
+    entry.setdefault("created_at", None)
+    with _lock:
+        runs = load_screen_history()
+        runs.append(entry)
+        if len(runs) > _MAX_SCREEN_RUNS:
+            runs = runs[-_MAX_SCREEN_RUNS:]
+        _screen_history_path().write_text(json.dumps(runs, indent=2), encoding="utf-8")

@@ -56,11 +56,12 @@ from typing import Any, List
 
 from tools.registry import tool_error, tool_result
 
-from . import store
+from . import screener, store
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-^=]{1,32}$")
 _DEFAULT_TIMEOUT_SECONDS = 3600
 _VALID_EXEC_MODES = {"docker", "local"}
+_SCREEN_TIMEOUT_SECONDS = 120
 
 
 def _tradingagents_dir() -> Path | None:
@@ -139,6 +140,41 @@ def _check_tradingagents_available() -> bool:
     return bool(diagnose().get("ready"))
 
 
+def diagnose_screener() -> dict[str, Any]:
+    """Report which screener path (stage A of tradingagents_screen) is
+    available: the native in-process path (yfinance importable directly in
+    Hermes's own environment) or the fallback that shells out to
+    scripts/screen_candidates.py inside TRADINGAGENTS_DIR (same reachability
+    rules as tradingagents_analyze, via diagnose() above)."""
+    native = screener.native_available()
+    if native:
+        return {"ready": True, "path": "native", "detail": "yfinance importable in Hermes's environment."}
+
+    diag = diagnose()
+    directory = _tradingagents_dir()
+    fallback_script_ok = bool(
+        diag.get("ready") and directory and (directory / "scripts" / "screen_candidates.py").is_file()
+    )
+    if fallback_script_ok:
+        return {
+            "ready": True, "path": "fallback",
+            "detail": f"yfinance not importable here; falling back to TradingAgents ({diag.get('mode')}).",
+        }
+    return {
+        "ready": False, "path": None,
+        "detail": (
+            "Neither path available: yfinance isn't importable in Hermes's environment "
+            "(pip install yfinance to enable the fast native path), and the fallback needs "
+            "scripts/screen_candidates.py in TRADINGAGENTS_DIR plus a reachable TradingAgents "
+            f"({diag.get('detail', 'not configured')})."
+        ),
+    }
+
+
+def _check_screener_available() -> bool:
+    return bool(diagnose_screener().get("ready"))
+
+
 def _parse_tickers(raw: Any) -> List[str]:
     if raw is None:
         # Dashboard-saved watchlist wins when present; otherwise fall back
@@ -168,13 +204,18 @@ class TradingAgentsRunError(RuntimeError):
         self.extra = extra
 
 
-def run_batch(tickers: List[str], trade_date: str | None = None) -> dict:
+def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | None = None) -> dict:
     """Run one TradingAgents batch invocation for `tickers` and persist
     results (report + history) via store.py.
 
-    Shared by the tradingagents_analyze tool handler and the dashboard's
-    queued run worker (dashboard/plugin_api.py) — one code path for "how
-    does a batch actually get run", so the two surfaces can't drift.
+    Shared by the tradingagents_analyze tool handler, tradingagents_screen's
+    deep-dive stage, and the dashboard's queued run worker
+    (dashboard/plugin_api.py) — one code path for "how does a batch actually
+    get run", so the surfaces can't drift.
+
+    ``horizon`` is "swing" or "position"; omitted entirely (batch_analyze.py
+    defaults to "position") when not given, so existing tradingagents_analyze
+    callers are unaffected.
 
     Raises TradingAgentsRunError on any failure. Returns the trimmed
     summary dict (see _persist_and_summarize) on success.
@@ -217,6 +258,8 @@ def run_batch(tickers: List[str], trade_date: str | None = None) -> dict:
         cmd = [diag["python"], "scripts/batch_analyze.py", "--tickers", ",".join(tickers)]
     if trade_date:
         cmd += ["--date", trade_date]
+    if horizon:
+        cmd += ["--horizon", horizon]
 
     try:
         proc = subprocess.run(
@@ -257,6 +300,120 @@ def run_batch(tickers: List[str], trade_date: str | None = None) -> dict:
     return _persist_and_summarize(payload)
 
 
+def run_screen(asset_classes: List[str], risk: str, horizon: str, limit: int = 20) -> list[dict]:
+    """Stage A: cheap candidate discovery, no TradingAgents deep-dive.
+
+    Tries the native in-process screener first (no subprocess); falls back
+    to shelling out to scripts/screen_candidates.py inside TRADINGAGENTS_DIR
+    when yfinance isn't importable in Hermes's own environment. Raises
+    TradingAgentsRunError on any failure, same as run_batch.
+    """
+    diag = diagnose_screener()
+    if not diag.get("ready"):
+        raise TradingAgentsRunError(diag.get("detail") or "Screener is not available.")
+
+    if diag["path"] == "native":
+        try:
+            return screener.discover(asset_classes, risk, horizon, limit)
+        except Exception as exc:  # noqa: BLE001
+            raise TradingAgentsRunError(f"Native screener failed: {type(exc).__name__}: {exc}")
+
+    # Fallback path — mirrors run_batch's subprocess construction.
+    ta_diag = diagnose()
+    directory = Path(ta_diag["directory"])
+    mode = ta_diag["mode"]
+    args = [
+        "--asset-classes", ",".join(asset_classes),
+        "--risk", risk,
+        "--horizon", horizon,
+        "--limit", str(limit),
+    ]
+    if mode == "docker":
+        cmd = [
+            "docker", "compose", "run", "--rm", "-T",
+            "--entrypoint", "python", ta_diag["compose_service"],
+            "scripts/screen_candidates.py",
+        ] + args
+    else:
+        cmd = [ta_diag["python"], "scripts/screen_candidates.py"] + args
+
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(directory), capture_output=True, text=True,
+            timeout=_SCREEN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise TradingAgentsRunError(f"Screener fallback timed out after {_SCREEN_TIMEOUT_SECONDS}s")
+    except Exception as exc:  # noqa: BLE001
+        raise TradingAgentsRunError(f"Failed to launch screener fallback: {type(exc).__name__}: {exc}")
+
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-40:])
+        raise TradingAgentsRunError(f"Screener fallback exited with code {proc.returncode}", output_tail=tail)
+
+    payload = None
+    for line in reversed(proc.stdout.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            break
+    if payload is None:
+        tail = "\n".join(proc.stdout.splitlines()[-40:])
+        raise TradingAgentsRunError("Could not find JSON output from screen_candidates.py", output_tail=tail)
+    if payload.get("error"):
+        raise TradingAgentsRunError(f"Screener fallback error: {payload['error']}")
+    return payload.get("candidates", [])
+
+
+def run_screen_and_analyze(
+    asset_classes: List[str], risk: str, horizon: str, limit: int, trade_date: str | None = None,
+) -> dict:
+    """Stage A (discovery) + stage B (TradingAgents deep dive on the
+    shortlist), the full tradingagents_screen pipeline."""
+    candidates = run_screen(asset_classes, risk, horizon, limit)
+    tickers = [c["ticker"] for c in candidates if c.get("ticker")]
+    by_ticker = {c["ticker"]: c for c in candidates if c.get("ticker")}
+
+    if not tickers:
+        return {"candidates": [], "results": []}
+
+    analysis = run_batch(tickers, trade_date, horizon)
+    enriched = []
+    for result in analysis.get("results", []):
+        screen_info = by_ticker.get(result.get("ticker"), {})
+        enriched.append({**result, "screen_source": screen_info.get("source"), "screen_metrics": screen_info.get("metrics")})
+
+    try:
+        store.save_screen_run({
+            "asset_classes": asset_classes, "risk": risk, "horizon": horizon,
+            "date": analysis.get("date"), "results": enriched, "created_at": int(time.time()),
+        })
+    except Exception:
+        pass  # dashboard history is best-effort; must not fail the tool call
+
+    return {"date": analysis.get("date"), "candidates": candidates, "results": enriched}
+
+
+def _handle_tradingagents_screen(args: dict, **kw) -> str:
+    asset_classes = args.get("asset_classes") or ["stock"]
+    if isinstance(asset_classes, str):
+        asset_classes = [a.strip() for a in asset_classes.split(",") if a.strip()]
+    risk = str(args.get("risk") or "medium").strip().lower()
+    horizon = str(args.get("horizon") or "position").strip().lower()
+    limit = int(args.get("limit") or 10)
+    trade_date = str(args.get("date") or "").strip() or None
+    try:
+        result = run_screen_and_analyze(asset_classes, risk, horizon, limit, trade_date)
+    except TradingAgentsRunError as exc:
+        return tool_error(str(exc), **exc.extra)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    return tool_result(result)
+
+
 def _handle_tradingagents_analyze(args: dict, **kw) -> str:
     tickers = _parse_tickers(args.get("tickers"))
     trade_date = str(args.get("date") or "").strip() or None
@@ -285,7 +442,12 @@ def _persist_and_summarize(payload: dict) -> dict:
             "date": date,
             "created_at": now,
             "asset_type": result.get("asset_type"),
+            "horizon": result.get("horizon"),
             "decision": result.get("decision"),
+            "sentiment_band": result.get("sentiment_band"),
+            "sentiment_score": result.get("sentiment_score"),
+            "price_target": result.get("price_target"),
+            "time_horizon": result.get("time_horizon"),
             "error": result.get("error"),
         }
         report_text = result.get("report")
@@ -304,6 +466,53 @@ def _persist_and_summarize(payload: dict) -> dict:
         summarized.append({k: v for k, v in entry.items() if k != "created_at"})
 
     return {"date": payload.get("date"), "results": summarized}
+
+
+TRADINGAGENTS_SCREEN_SCHEMA = {
+    "name": "tradingagents_screen",
+    "description": (
+        "Discover new trading candidates and analyze them: first runs a cheap "
+        "quantitative screen (Yahoo Finance screener for stocks, CoinGecko for "
+        "crypto, a static futures list for commodities) filtered by risk level "
+        "and trade horizon, then runs the full TradingAgents multi-agent pipeline "
+        "on the resulting shortlist so each candidate gets a sentiment, a "
+        "buy/sell/hold direction, and the underlying screen metrics. Use this "
+        "instead of tradingagents_analyze when the user wants NEW ideas rather "
+        "than an update on tickers they already picked."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "asset_classes": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["stock", "crypto", "commodity"]},
+                "description": "Which asset classes to screen. Defaults to [\"stock\"].",
+            },
+            "risk": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Risk appetite for the screen. Defaults to \"medium\".",
+            },
+            "horizon": {
+                "type": "string",
+                "enum": ["swing", "position"],
+                "description": (
+                    "\"swing\" for a short trade (a few days, momentum-driven), "
+                    "\"position\" for a hold (multi-month trend). Defaults to \"position\"."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max candidates per asset class to shortlist for deep-dive analysis. Defaults to 10.",
+            },
+            "date": {
+                "type": "string",
+                "description": "Analysis date as YYYY-MM-DD. Defaults to today.",
+            },
+        },
+        "required": [],
+    },
+}
 
 
 TRADINGAGENTS_ANALYZE_SCHEMA = {

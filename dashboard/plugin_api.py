@@ -91,7 +91,9 @@ def _validate_date(date: str) -> str:
 
 @router.get("/status")
 def get_status():
-    return tool.diagnose()
+    status = tool.diagnose()
+    status["screener"] = tool.diagnose_screener()
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +113,17 @@ class WatchlistBody(BaseModel):
 def put_watchlist(payload: WatchlistBody):
     try:
         tickers = store.save_watchlist(payload.tickers)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"tickers": tickers}
+
+
+@router.post("/watchlist/add")
+def post_watchlist_add(payload: WatchlistBody):
+    """Merge-add tickers (e.g. from a screener result) without clobbering
+    the rest of the watchlist — as opposed to PUT /watchlist's full replace."""
+    try:
+        tickers = store.add_to_watchlist(payload.tickers)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"tickers": tickers}
@@ -205,7 +218,12 @@ def _worker_loop() -> None:
             job["started_at"] = time.time()
 
         try:
-            result = tool.run_batch(job["tickers"], job.get("date"))
+            if job.get("kind") == "screen":
+                result = tool.run_screen_and_analyze(
+                    job["asset_classes"], job["risk"], job["horizon"], job["limit"], job.get("date"),
+                )
+            else:
+                result = tool.run_batch(job["tickers"], job.get("date"))
             with _jobs_lock:
                 job["status"] = "done"
                 job["result"] = result
@@ -270,7 +288,9 @@ def post_run(payload: RunBody):
 
     job = {
         "id": uuid.uuid4().hex[:12],
+        "kind": "analyze",
         "tickers": tickers,
+        "is_all": payload.all,
         "date": payload.date,
         "status": "queued",
         "queued_at": time.time(),
@@ -291,5 +311,74 @@ def post_run(payload: RunBody):
 @router.get("/run/status")
 def get_run_status():
     with _jobs_lock:
-        jobs = sorted(_jobs_by_id.values(), key=lambda j: j["queued_at"], reverse=True)
+        jobs = sorted(
+            (j for j in _jobs_by_id.values() if j.get("kind", "analyze") == "analyze"),
+            key=lambda j: j["queued_at"], reverse=True,
+        )
     return {"jobs": jobs}
+
+
+# ---------------------------------------------------------------------------
+# POST /screen + GET /screen/status + GET /screen/history — the two-stage
+# screener (discovery + deep-dive). Shares the same FIFO worker as /run so a
+# screen and an analyze run triggered around the same time don't fire
+# overlapping docker/local invocations.
+# ---------------------------------------------------------------------------
+
+class ScreenBody(BaseModel):
+    asset_classes: Optional[list[str]] = None
+    risk: str = "medium"
+    horizon: str = "position"
+    limit: int = 10
+    date: Optional[str] = None
+
+
+@router.post("/screen")
+def post_screen(payload: ScreenBody):
+    _ensure_worker()
+
+    asset_classes = payload.asset_classes or ["stock"]
+    if payload.risk not in ("low", "medium", "high"):
+        raise HTTPException(status_code=400, detail="risk must be one of: low, medium, high")
+    if payload.horizon not in ("swing", "position"):
+        raise HTTPException(status_code=400, detail="horizon must be one of: swing, position")
+
+    job = {
+        "id": uuid.uuid4().hex[:12],
+        "kind": "screen",
+        "asset_classes": asset_classes,
+        "risk": payload.risk,
+        "horizon": payload.horizon,
+        "limit": payload.limit,
+        "date": payload.date,
+        "tickers": [],  # screen jobs discover their own tickers; kept for UI symmetry with analyze jobs
+        "status": "queued",
+        "queued_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+        "result": None,
+    }
+    with _queue_not_empty:
+        _jobs_by_id[job["id"]] = job
+        _prune_jobs_locked()
+        _job_queue.append(job)
+        _queue_not_empty.notify()
+
+    return {"job": job}
+
+
+@router.get("/screen/status")
+def get_screen_status():
+    with _jobs_lock:
+        jobs = sorted(
+            (j for j in _jobs_by_id.values() if j.get("kind") == "screen"),
+            key=lambda j: j["queued_at"], reverse=True,
+        )
+    return {"jobs": jobs}
+
+
+@router.get("/screen/history")
+def get_screen_history():
+    runs = sorted(store.load_screen_history(), key=lambda r: r.get("created_at") or 0, reverse=True)
+    return {"runs": runs}
