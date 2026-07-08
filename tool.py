@@ -46,11 +46,13 @@ and link to the full report — see ``dashboard/plugin_api.py``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, List
 
@@ -58,10 +60,33 @@ from tools.registry import tool_error, tool_result
 
 from . import screener, store
 
+logger = logging.getLogger(__name__)
+
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-^=]{1,32}$")
 _DEFAULT_TIMEOUT_SECONDS = 3600
 _VALID_EXEC_MODES = {"docker", "local"}
 _SCREEN_TIMEOUT_SECONDS = 120
+_CONTAINER_STOP_TIMEOUT_SECONDS = 30
+
+
+def _force_stop_container(container_name: str) -> None:
+    """Best-effort cleanup for a timed-out ``docker compose run``.
+
+    ``subprocess.run(..., timeout=...)`` only kills the ``docker compose
+    run`` CLI process on timeout — it does NOT stop the container that CLI
+    started, since a killed client doesn't get a chance to signal it.
+    Without this, a timed-out run's container keeps running (and consuming
+    the LLM backend's capacity) indefinitely — observed in practice: a
+    timed-out screen run's container was still making LLM calls 2+ hours
+    later, starving every subsequent run of a shared local LLM backend.
+    """
+    try:
+        subprocess.run(
+            ["docker", "stop", container_name],
+            capture_output=True, timeout=_CONTAINER_STOP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 — cleanup failure shouldn't mask the timeout error
+        logger.warning("failed to stop timed-out container %s: %s", container_name, exc)
 
 
 def _tradingagents_dir() -> Path | None:
@@ -240,6 +265,7 @@ def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | 
         raise TradingAgentsRunError(f"Invalid ticker symbol(s): {', '.join(invalid)}")
 
     timeout_seconds = int(os.environ.get("TRADINGAGENTS_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS))
+    container_name = f"tradingagents-run-{uuid.uuid4().hex[:12]}"
 
     if mode == "docker":
         # --entrypoint python is required: the image's ENTRYPOINT is the
@@ -248,8 +274,11 @@ def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | 
         # that entrypoint (`tradingagents python scripts/batch_analyze.py
         # ...`) instead of replacing it — the classic Docker exec-form
         # ENTRYPOINT gotcha.
+        # --name gives the container a name we control, so a timeout below
+        # can target it for cleanup instead of leaving it running forever.
         cmd = [
             "docker", "compose", "run", "--rm", "-T",
+            "--name", container_name,
             "--entrypoint", "python", diag["compose_service"],
             "scripts/batch_analyze.py",
             "--tickers", ",".join(tickers),
@@ -270,6 +299,8 @@ def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | 
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
+        if mode == "docker":
+            _force_stop_container(container_name)
         raise TradingAgentsRunError(
             f"tradingagents run timed out after {timeout_seconds}s for tickers: "
             f"{', '.join(tickers)} (mode={mode})"
@@ -331,9 +362,11 @@ def run_screen(
         "--limit", str(limit),
         "--price-range", price_range,
     ]
+    screen_container_name = f"tradingagents-screen-{uuid.uuid4().hex[:12]}"
     if mode == "docker":
         cmd = [
             "docker", "compose", "run", "--rm", "-T",
+            "--name", screen_container_name,
             "--entrypoint", "python", ta_diag["compose_service"],
             "scripts/screen_candidates.py",
         ] + args
@@ -346,6 +379,8 @@ def run_screen(
             timeout=_SCREEN_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
+        if mode == "docker":
+            _force_stop_container(screen_container_name)
         raise TradingAgentsRunError(f"Screener fallback timed out after {_SCREEN_TIMEOUT_SECONDS}s")
     except Exception as exc:  # noqa: BLE001
         raise TradingAgentsRunError(f"Failed to launch screener fallback: {type(exc).__name__}: {exc}")
