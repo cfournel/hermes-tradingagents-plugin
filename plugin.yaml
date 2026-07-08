@@ -1,5 +1,5 @@
 name: tradingagents
-version: 1.3.0
+version: 1.3.1
 description: "Run TauricResearch/TradingAgents (multi-agent LLM trading research) for one or more tickers, via Docker or a local checkout. Adds tradingagents_analyze, driven ad hoc, from a daily hermes cron schedule, or straight from the dashboard's Run / Run all (queued) buttons, plus a panel for the watchlist, last-analysis history, full reports, and a connectivity status card."
 author: cfournel
 kind: standalone

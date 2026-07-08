@@ -3,9 +3,11 @@
 
 Runs ``TradingAgentsGraph.propagate()`` for each ticker and prints a single
 JSON object to stdout. Intended to be invoked from outside the container
-(e.g. ``docker compose run --rm -T tradingagents python scripts/batch_analyze.py
---tickers AAPL,NVDA,BTC-USD``) by an external scheduler or agent that cannot
-drive the interactive ``tradingagents`` CLI.
+(e.g. ``docker compose run --rm -T --entrypoint python tradingagents
+scripts/batch_analyze.py --tickers AAPL,NVDA,BTC-USD`` — note
+``--entrypoint python``, required because the image's ENTRYPOINT is the
+``tradingagents`` CLI itself) by an external scheduler or agent that
+cannot drive the interactive ``tradingagents`` CLI.
 
 A failure on one ticker is recorded in its result entry and does not stop
 the rest of the batch.

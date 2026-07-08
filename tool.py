@@ -201,9 +201,16 @@ def run_batch(tickers: List[str], trade_date: str | None = None) -> dict:
     timeout_seconds = int(os.environ.get("TRADINGAGENTS_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS))
 
     if mode == "docker":
+        # --entrypoint python is required: the image's ENTRYPOINT is the
+        # `tradingagents` CLI itself, so without overriding it, "python
+        # scripts/batch_analyze.py ..." would be appended as *arguments* to
+        # that entrypoint (`tradingagents python scripts/batch_analyze.py
+        # ...`) instead of replacing it — the classic Docker exec-form
+        # ENTRYPOINT gotcha.
         cmd = [
-            "docker", "compose", "run", "--rm", "-T", diag["compose_service"],
-            "python", "scripts/batch_analyze.py",
+            "docker", "compose", "run", "--rm", "-T",
+            "--entrypoint", "python", diag["compose_service"],
+            "scripts/batch_analyze.py",
             "--tickers", ",".join(tickers),
         ]
     else:

@@ -44,10 +44,16 @@ Sanity check it directly first, matching however you actually run
 TradingAgents:
 
 ```bash
-# Docker
+# Docker — note --entrypoint python: the image's ENTRYPOINT is the
+# `tradingagents` CLI itself, so without overriding it your command gets
+# appended as *arguments* to that CLI instead of replacing it.
 cd /path/to/TradingAgents
-docker compose run --rm -T tradingagents python scripts/batch_analyze.py \
+docker compose run --rm -T --entrypoint python tradingagents scripts/batch_analyze.py \
   --tickers AAPL,NVDA --date 2026-07-06
+
+# If this is the first run since adding batch_analyze.py, rebuild first —
+# an existing image built before the file was added won't have it:
+#   docker compose build tradingagents
 
 # Local (no Docker) — use the interpreter TradingAgents is installed in
 cd /path/to/TradingAgents

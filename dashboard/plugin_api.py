@@ -212,7 +212,15 @@ def _worker_loop() -> None:
         except tool.TradingAgentsRunError as exc:
             with _jobs_lock:
                 job["status"] = "error"
-                job["error"] = str(exc)
+                # Fold in output_tail (subprocess stderr/stdout tail) when
+                # present — the bare message ("exited with code 2") isn't
+                # actionable on its own; the tail usually has the real
+                # reason (missing file, bad CLI args, provider auth, ...).
+                message = str(exc)
+                tail = exc.extra.get("output_tail")
+                if tail:
+                    message = f"{message}\n\n{tail}"
+                job["error"] = message
         except Exception as exc:  # noqa: BLE001 — worker must never die
             with _jobs_lock:
                 job["status"] = "error"

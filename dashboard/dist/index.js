@@ -391,7 +391,11 @@
         ),
       ),
       loadErr ? h("div", { className: "text-sm text-destructive" }, loadErr) : null,
-      runErr ? h("div", { className: "text-sm text-destructive" }, runErr) : null,
+      runErr
+        ? h("pre", {
+            className: "text-sm text-destructive hermes-tradingagents-run-error",
+          }, runErr)
+        : null,
       h(StatusCard, { status: status, onRefresh: load }),
       h(WatchlistEditor, {
         tickers: tickers,
