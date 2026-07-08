@@ -229,7 +229,9 @@ class TradingAgentsRunError(RuntimeError):
         self.extra = extra
 
 
-def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | None = None) -> dict:
+def run_batch(
+    tickers: List[str], trade_date: str | None = None, horizon: str | None = None, quick: bool = False,
+) -> dict:
     """Run one TradingAgents batch invocation for `tickers` and persist
     results (report + history) via store.py.
 
@@ -241,6 +243,16 @@ def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | 
     ``horizon`` is "swing" or "position"; omitted entirely (batch_analyze.py
     defaults to "position") when not given, so existing tradingagents_analyze
     callers are unaffected.
+
+    ``quick``, when True, passes --quick so every agent (including the
+    research manager and portfolio manager, normally the deep-think model)
+    uses the quick-think model for this run. Deliberately opt-in per call
+    rather than a config change — a deployment where deep_think_llm is a
+    much larger/slower model than quick_think_llm can make every ordinary
+    ticker analysis painfully slow if the two share one model slot (e.g. a
+    single local llama.cpp instance), but tradingagents_analyze / "Run all"
+    should still get the deep model's full reasoning. Only the screener's
+    shortlist deep-dive (a cheap pre-filter, not a final decision) sets this.
 
     Raises TradingAgentsRunError on any failure. Returns the trimmed
     summary dict (see _persist_and_summarize) on success.
@@ -289,6 +301,8 @@ def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | 
         cmd += ["--date", trade_date]
     if horizon:
         cmd += ["--horizon", horizon]
+    if quick:
+        cmd += ["--quick"]
 
     try:
         proc = subprocess.run(
@@ -444,7 +458,7 @@ def run_screen_and_analyze(
     trade_date_out = trade_date
     for ticker in tickers:
         try:
-            analysis = run_batch([ticker], trade_date, horizon)
+            analysis = run_batch([ticker], trade_date, horizon, quick=True)
             trade_date_out = analysis.get("date") or trade_date_out
             ticker_results = analysis.get("results") or []
             result = ticker_results[0] if ticker_results else {"ticker": ticker, "error": "no result returned"}
