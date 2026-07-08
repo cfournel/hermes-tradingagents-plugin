@@ -409,3 +409,97 @@ def get_screen_status():
 def get_screen_history():
     runs = sorted(store.load_screen_history(), key=lambda r: r.get("created_at") or 0, reverse=True)
     return {"runs": runs}
+
+
+# ---------------------------------------------------------------------------
+# GET/POST/DELETE /screen/cron — schedule a recurring tradingagents_screen
+# run at the filters currently selected in the Screener panel. Uses Hermes's
+# own cron subsystem (cron.jobs) directly — this dashboard process already
+# has it importable, same as the built-in Cron page.
+#
+# At most one screener cron job is tracked at a time, identified by a fixed
+# job name (_SCREENER_CRON_NAME) rather than by ID, so the panel's "does a
+# schedule already exist" toggle doesn't need to remember an ID across a
+# page refresh.
+# ---------------------------------------------------------------------------
+
+_SCREENER_CRON_NAME = "tradingagents-screener"
+_CRON_FREQUENCY_SCHEDULES = {
+    "daily": "0 9 * * *",
+    "weekly": "0 9 * * 1",
+    "monthly": "0 9 1 * *",
+}
+
+
+def _find_screener_cron_job() -> Optional[dict]:
+    from cron.jobs import list_jobs
+
+    for job in list_jobs(include_disabled=True):
+        if job.get("name") == _SCREENER_CRON_NAME:
+            return job
+    return None
+
+
+def _cron_job_summary(job: dict) -> dict:
+    return {
+        "exists": True,
+        "job_id": job.get("id"),
+        "schedule": job.get("schedule_display"),
+        "next_run_at": job.get("next_run_at"),
+        "enabled": job.get("enabled", True),
+    }
+
+
+@router.get("/screen/cron")
+def get_screen_cron():
+    job = _find_screener_cron_job()
+    if not job:
+        return {"exists": False}
+    return _cron_job_summary(job)
+
+
+class ScreenCronBody(BaseModel):
+    frequency: str  # "daily" | "weekly" | "monthly"
+    asset_classes: Optional[list[str]] = None
+    risk: str = "medium"
+    horizon: str = "position"
+    limit: int = 10
+    price_range: str = "all"
+
+
+@router.post("/screen/cron")
+def post_screen_cron(payload: ScreenCronBody):
+    if payload.frequency not in _CRON_FREQUENCY_SCHEDULES:
+        raise HTTPException(status_code=400, detail="frequency must be one of: daily, weekly, monthly")
+    if _find_screener_cron_job():
+        raise HTTPException(status_code=409, detail="A screener cron job already exists — remove it first.")
+
+    asset_classes = payload.asset_classes or ["stock"]
+    prompt = (
+        f"Run the tradingagents_screen tool with asset_classes={asset_classes!r}, "
+        f"risk={payload.risk!r}, horizon={payload.horizon!r}, limit={payload.limit}, "
+        f"price_range={payload.price_range!r}. Summarize each result's ticker, "
+        "direction, and sentiment in a short report."
+    )
+
+    from cron.jobs import create_job
+
+    job = create_job(
+        prompt=prompt,
+        schedule=_CRON_FREQUENCY_SCHEDULES[payload.frequency],
+        name=_SCREENER_CRON_NAME,
+        deliver="local",
+    )
+    return _cron_job_summary(job)
+
+
+@router.delete("/screen/cron")
+def delete_screen_cron():
+    job = _find_screener_cron_job()
+    if not job:
+        raise HTTPException(status_code=404, detail="No screener cron job exists.")
+
+    from cron.jobs import remove_job
+
+    remove_job(job["id"])
+    return {"exists": False}

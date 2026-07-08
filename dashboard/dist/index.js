@@ -89,8 +89,40 @@
     });
   }
 
+  function fetchScreenCron() {
+    return SDK.fetchJSON(`${API}/screen/cron`);
+  }
+
+  function postScreenCron(body) {
+    return SDK.fetchJSON(`${API}/screen/cron`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function deleteScreenCron() {
+    return SDK.fetchJSON(`${API}/screen/cron`, { method: "DELETE" });
+  }
+
   const RUN_POLL_INTERVAL_MS = 3000;
   const ASSET_CLASSES = ["stock", "crypto", "commodity"];
+  const SCREENER_FILTERS_STORAGE_KEY = "hermes-tradingagents-screener-filters";
+
+  function loadStoredScreenerFilters() {
+    try {
+      const raw = window.sessionStorage.getItem(SCREENER_FILTERS_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveStoredScreenerFilters(filters) {
+    try {
+      window.sessionStorage.setItem(SCREENER_FILTERS_STORAGE_KEY, JSON.stringify(filters));
+    } catch (e) { /* sessionStorage unavailable (private mode, quota) — filters just won't persist */ }
+  }
 
   // Parse a textarea's free-form contents (newline- or comma-separated,
   // any mix of whitespace) into a clean, deduped, upper-cased ticker list.
@@ -371,15 +403,72 @@
     { value: "301_plus", label: "$301+" },
   ];
 
+  const CRON_FREQUENCIES = [
+    { value: "daily", label: "Daily" },
+    { value: "weekly", label: "Weekly" },
+    { value: "monthly", label: "Monthly" },
+  ];
+
   function ScreenerPanel(props) {
-    const [assetClasses, setAssetClasses] = useState(["stock"]);
-    const [risk, setRisk] = useState("medium");
-    const [horizon, setHorizon] = useState("position");
-    const [limit, setLimit] = useState(10);
-    const [priceRange, setPriceRange] = useState("all");
+    const storedFilters = useMemo(loadStoredScreenerFilters, []);
+    const [assetClasses, setAssetClasses] = useState((storedFilters && storedFilters.assetClasses) || ["stock"]);
+    const [risk, setRisk] = useState((storedFilters && storedFilters.risk) || "medium");
+    const [horizon, setHorizon] = useState((storedFilters && storedFilters.horizon) || "position");
+    const [limit, setLimit] = useState((storedFilters && storedFilters.limit) || 10);
+    const [priceRange, setPriceRange] = useState((storedFilters && storedFilters.priceRange) || "all");
     const [job, setJob] = useState(null); // { id, status }
     const [results, setResults] = useState([]);
     const [err, setErr] = useState(null);
+
+    // Persist filter selections so they survive a page refresh — read once
+    // above (lazy initial state), written back here on every change.
+    useEffect(function () {
+      saveStoredScreenerFilters({ assetClasses: assetClasses, risk: risk, horizon: horizon, limit: limit, priceRange: priceRange });
+    }, [assetClasses, risk, horizon, limit, priceRange]);
+
+    const [cronJob, setCronJob] = useState(null); // null while loading; {} shape once known: {exists, schedule, ...}
+    const [cronFrequency, setCronFrequency] = useState("daily");
+    const [cronBusy, setCronBusy] = useState(false);
+    const [cronErr, setCronErr] = useState(null);
+
+    const loadCronStatus = useCallback(function () {
+      fetchScreenCron()
+        .then(function (result) { setCronJob(result); })
+        .catch(function () { setCronJob({ exists: false }); });
+    }, []);
+
+    useEffect(function () { loadCronStatus(); }, [loadCronStatus]);
+
+    function onCreateCron() {
+      setCronBusy(true);
+      setCronErr(null);
+      postScreenCron({
+        frequency: cronFrequency, asset_classes: assetClasses, risk: risk,
+        horizon: horizon, limit: Number(limit) || 10, price_range: priceRange,
+      })
+        .then(function (result) {
+          setCronBusy(false);
+          setCronJob(result);
+        })
+        .catch(function (e) {
+          setCronBusy(false);
+          setCronErr(parseApiErrorMessage(e));
+        });
+    }
+
+    function onDeleteCron() {
+      setCronBusy(true);
+      setCronErr(null);
+      deleteScreenCron()
+        .then(function () {
+          setCronBusy(false);
+          setCronJob({ exists: false });
+        })
+        .catch(function (e) {
+          setCronBusy(false);
+          setCronErr(parseApiErrorMessage(e));
+        });
+    }
 
     function toggleAssetClass(cls) {
       setAssetClasses(function (prev) {
@@ -523,7 +612,33 @@
                   ? "Queued…"
                   : `Running… (${results.length}/${job.total || "?"} analyzed)`)
               : "Run screen"),
+          h("div", { className: "flex items-center gap-2" },
+            h("select", {
+              value: cronFrequency,
+              disabled: cronBusy || (cronJob && cronJob.exists),
+              onChange: function (e) { setCronFrequency(e.target.value); },
+            },
+              CRON_FREQUENCIES.map(function (f) {
+                return h("option", { key: f.value, value: f.value }, f.label);
+              }),
+            ),
+            h(Button, {
+              size: "sm",
+              variant: "outline",
+              disabled: cronBusy || !cronJob || cronJob.exists,
+              onClick: onCreateCron,
+            }, cronJob && cronJob.exists ? `Scheduled (${cronJob.schedule || cronFrequency})` : "Schedule screen"),
+            (cronJob && cronJob.exists)
+              ? h(Button, {
+                  size: "sm",
+                  variant: "outline",
+                  disabled: cronBusy,
+                  onClick: onDeleteCron,
+                }, "Remove schedule")
+              : null,
+          ),
         ),
+        cronErr ? h("div", { className: "text-sm text-destructive" }, cronErr) : null,
         err ? h("div", { className: "text-sm text-destructive" }, err) : null,
         h(ScreenResultsTable, { rows: results, onAdded: props.onWatchlistChanged }),
       ),

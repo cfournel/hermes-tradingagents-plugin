@@ -169,6 +169,21 @@ why, if neither is ready). No new required env vars — the fallback reuses
 Results from a screen are also added to the dashboard's screen history and
 can be added to the watchlist individually (or all at once) from there.
 
+**Filter selections persist** across a page refresh (stored in the
+browser's `sessionStorage`, keyed per tab) — reopening the Screener panel
+shows the same asset classes / risk / horizon / price range / limit you
+last had selected.
+
+**Scheduling a recurring screen**: the Screener panel has a frequency
+dropdown (daily / weekly / monthly) and a "Schedule screen" button next to
+Run screen. Clicking it creates a Hermes cron job (using the filters
+currently selected) that runs `tradingagents_screen` on that cadence —
+daily/weekly/monthly at 09:00. Only one screener cron job is tracked at a
+time: once one exists, the button grays out and a "Remove schedule" button
+appears next to it. This uses Hermes's own cron subsystem directly (same
+one `hermes cron list` shows), so the scheduled runs only fire while the
+Hermes gateway is running.
+
 ## 7. Dashboard panel
 
 The plugin ships a dashboard tab (`dashboard/`) — open `hermes dashboard`
