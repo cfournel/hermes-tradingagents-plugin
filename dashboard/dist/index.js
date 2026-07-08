@@ -45,6 +45,10 @@
     return SDK.fetchJSON(`${API}/history`);
   }
 
+  function fetchStatus() {
+    return SDK.fetchJSON(`${API}/status`);
+  }
+
   function fetchReport(ticker, date) {
     return SDK.fetchJSON(`${API}/reports/${encodeURIComponent(ticker)}/${encodeURIComponent(date)}`);
   }
@@ -69,6 +73,33 @@
     if (text.indexOf("BUY") !== -1) return "default";
     if (text.indexOf("SELL") !== -1) return "destructive";
     return "secondary";
+  }
+
+  function StatusCard(props) {
+    const status = props.status;
+    if (!status) {
+      return null;
+    }
+    const ready = !!status.ready;
+    const modeLabel = status.mode === "local" ? "local (no Docker)" : "docker";
+    return h(Card, {
+      className: cn(
+        "hermes-tradingagents-status",
+        ready ? "hermes-tradingagents-status-ok" : "hermes-tradingagents-status-bad",
+      ),
+    },
+      h(CardContent, { className: "flex items-center justify-between gap-3 py-3" },
+        h("div", { className: "flex items-center gap-2" },
+          h(Badge, { variant: ready ? "default" : "destructive" }, ready ? "Reachable" : "Not reachable"),
+          h("span", { className: "text-sm" }, `mode: ${modeLabel}`),
+          status.directory
+            ? h("span", { className: "text-xs text-muted-foreground" }, status.directory)
+            : null,
+        ),
+        h(Button, { size: "sm", variant: "outline", onClick: props.onRefresh }, "Recheck"),
+      ),
+      h(CardContent, { className: "pt-0 text-xs text-muted-foreground" }, status.detail),
+    );
   }
 
   function WatchlistEditor(props) {
@@ -207,6 +238,7 @@
   }
 
   function TradingAgentsPanel() {
+    const [status, setStatus] = useState(null);
     const [tickers, setTickers] = useState([]);
     const [rows, setRows] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -215,10 +247,11 @@
     const load = useCallback(function () {
       setLoading(true);
       setLoadErr(null);
-      Promise.all([fetchWatchlist(), fetchHistory()])
+      Promise.all([fetchStatus(), fetchWatchlist(), fetchHistory()])
         .then(function (results) {
-          setTickers((results[0] && results[0].tickers) || []);
-          setRows((results[1] && results[1].rows) || []);
+          setStatus(results[0] || null);
+          setTickers((results[1] && results[1].tickers) || []);
+          setRows((results[2] && results[2].rows) || []);
           setLoading(false);
         })
         .catch(function (e) {
@@ -236,6 +269,7 @@
           loading ? "Loading…" : "Refresh"),
       ),
       loadErr ? h("div", { className: "text-sm text-destructive" }, loadErr) : null,
+      h(StatusCard, { status: status, onRefresh: load }),
       h(WatchlistEditor, {
         tickers: tickers,
         onSaved: function (saved) { setTickers(saved); load(); },

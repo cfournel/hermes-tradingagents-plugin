@@ -1,25 +1,42 @@
-"""tradingagents_analyze tool — shells out to the TradingAgents Docker
-container so Hermes can request multi-symbol trading analyses.
+"""tradingagents_analyze tool — runs TradingAgents (Docker or a local
+checkout) so Hermes can request multi-symbol trading analyses.
 
 TradingAgents (https://github.com/TauricResearch/TradingAgents) ships an
-interactive-only CLI; there is no HTTP API to call. Instead this tool drives
-``docker compose run`` against a small non-interactive batch entry point
-(``scripts/batch_analyze.py``) that must exist in the target checkout — see
-this plugin's README for the one-file addition required on the TradingAgents
-side.
+interactive-only CLI; there is no HTTP API to call. Instead this tool runs
+a small non-interactive batch entry point (``scripts/batch_analyze.py``)
+that must exist in the target checkout — see this plugin's README for the
+one-file addition required on the TradingAgents side — either inside its
+Docker container (``TRADINGAGENTS_EXEC_MODE=docker``, the default) or with
+a plain Python interpreter against a local, non-Docker checkout
+(``TRADINGAGENTS_EXEC_MODE=local``).
 
 Config (environment variables, e.g. in ~/.hermes/.env or the process env):
 
     TRADINGAGENTS_DIR               Path to a TradingAgents checkout that
-                                     contains docker-compose.yml and
-                                     scripts/batch_analyze.py. Required.
-    TRADINGAGENTS_COMPOSE_SERVICE   Compose service to run. Default: "tradingagents".
+                                     contains scripts/batch_analyze.py (and,
+                                     for docker mode, docker-compose.yml).
+                                     Required.
+    TRADINGAGENTS_EXEC_MODE          "docker" (default) or "local".
+    TRADINGAGENTS_COMPOSE_SERVICE   docker mode only. Compose service to
+                                     run. Default: "tradingagents".
+    TRADINGAGENTS_PYTHON             local mode only. Python interpreter to
+                                     run the batch script with — point this
+                                     at the venv/conda env TradingAgents is
+                                     installed in, e.g.
+                                     "/path/to/.venv/bin/python". Default:
+                                     "python3" (whatever that resolves to
+                                     on PATH).
     TRADINGAGENTS_WATCHLIST         Comma-separated default tickers used when
                                      the tool is called without `tickers` AND
                                      no watchlist has been saved yet via the
                                      dashboard panel (see dashboard/). Once a
                                      dashboard watchlist exists, it wins.
     TRADINGAGENTS_TIMEOUT_SECONDS   Per-call subprocess timeout. Default: 3600.
+
+``diagnose()`` is the single source of truth for "is this reachable" — the
+tool's own preflight check and the dashboard's connectivity status card
+(``dashboard/plugin_api.py::GET /status``) both call it, so they can never
+disagree about whether a run would actually work.
 
 Every run (success or failure, dashboard-triggered or not) is recorded via
 ``store.py`` so the dashboard panel can show the latest decision per ticker
@@ -43,6 +60,7 @@ from . import store
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-^=]{1,32}$")
 _DEFAULT_TIMEOUT_SECONDS = 3600
+_VALID_EXEC_MODES = {"docker", "local"}
 
 
 def _tradingagents_dir() -> Path | None:
@@ -50,13 +68,75 @@ def _tradingagents_dir() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
-def _check_tradingagents_available() -> bool:
+def _exec_mode() -> str:
+    mode = os.environ.get("TRADINGAGENTS_EXEC_MODE", "docker").strip().lower()
+    return mode if mode in _VALID_EXEC_MODES else "docker"
+
+
+def _python_bin() -> str:
+    return os.environ.get("TRADINGAGENTS_PYTHON", "python3").strip() or "python3"
+
+
+def _python_resolvable(python_bin: str) -> bool:
+    # A path (has a separator, or explicitly relative/home) must exist and
+    # be executable; a bare command name is resolved against PATH instead.
+    if os.sep in python_bin or python_bin.startswith("~") or python_bin.startswith("."):
+        candidate = Path(python_bin).expanduser()
+        return candidate.is_file() and os.access(candidate, os.X_OK)
+    return shutil.which(python_bin) is not None
+
+
+def diagnose() -> dict[str, Any]:
+    """Report whether the configured TradingAgents target is reachable.
+
+    Returns at least ``{"mode": ..., "directory": ..., "ready": bool,
+    "detail": str}``; docker mode also returns ``compose_service``, local
+    mode also returns ``python``.
+    """
+    mode = _exec_mode()
     directory = _tradingagents_dir()
+    info: dict[str, Any] = {"mode": mode, "directory": str(directory) if directory else None}
+
     if directory is None:
-        return False
-    if not (directory / "docker-compose.yml").is_file():
-        return False
-    return shutil.which("docker") is not None
+        info.update(ready=False, detail="TRADINGAGENTS_DIR is not set.")
+        return info
+    if not directory.is_dir():
+        info.update(ready=False, detail=f"TRADINGAGENTS_DIR does not exist: {directory}")
+        return info
+
+    script = directory / "scripts" / "batch_analyze.py"
+    if not script.is_file():
+        info.update(ready=False, detail=(
+            f"scripts/batch_analyze.py not found under {directory}. Copy it from "
+            "this plugin's reference/ directory into the TradingAgents checkout."
+        ))
+        return info
+
+    if mode == "docker":
+        if not (directory / "docker-compose.yml").is_file():
+            info.update(ready=False, detail=f"No docker-compose.yml found in {directory}.")
+            return info
+        if shutil.which("docker") is None:
+            info.update(ready=False, detail="The 'docker' binary is not on PATH.")
+            return info
+        service = os.environ.get("TRADINGAGENTS_COMPOSE_SERVICE", "tradingagents").strip() or "tradingagents"
+        info.update(ready=True, detail="docker + docker-compose.yml + batch script found.", compose_service=service)
+        return info
+
+    # mode == "local"
+    python_bin = _python_bin()
+    if not _python_resolvable(python_bin):
+        info.update(ready=False, detail=(
+            f"Python interpreter not found: {python_bin!r}. Set TRADINGAGENTS_PYTHON "
+            "to the interpreter TradingAgents is installed in."
+        ))
+        return info
+    info.update(ready=True, detail="local python interpreter + batch script found.", python=python_bin)
+    return info
+
+
+def _check_tradingagents_available() -> bool:
+    return bool(diagnose().get("ready"))
 
 
 def _parse_tickers(raw: Any) -> List[str]:
@@ -78,16 +158,14 @@ def _parse_tickers(raw: Any) -> List[str]:
 
 
 def _handle_tradingagents_analyze(args: dict, **kw) -> str:
-    directory = _tradingagents_dir()
-    if directory is None:
+    diag = diagnose()
+    if not diag.get("ready"):
         return tool_error(
-            "TRADINGAGENTS_DIR is not set. Point it at a TradingAgents checkout "
-            "(containing docker-compose.yml and scripts/batch_analyze.py)."
+            diag.get("detail") or "TradingAgents is not reachable — check configuration.",
+            mode=diag.get("mode"),
         )
-    if not (directory / "docker-compose.yml").is_file():
-        return tool_error(f"No docker-compose.yml found in TRADINGAGENTS_DIR ({directory}).")
-    if shutil.which("docker") is None:
-        return tool_error("The 'docker' binary is not on PATH.")
+    directory = Path(diag["directory"])
+    mode = diag["mode"]
 
     tickers = _parse_tickers(args.get("tickers"))
     if not tickers:
@@ -101,14 +179,16 @@ def _handle_tradingagents_analyze(args: dict, **kw) -> str:
         return tool_error(f"Invalid ticker symbol(s): {', '.join(invalid)}")
 
     trade_date = str(args.get("date") or "").strip() or None
-    service = os.environ.get("TRADINGAGENTS_COMPOSE_SERVICE", "tradingagents").strip() or "tradingagents"
     timeout_seconds = int(os.environ.get("TRADINGAGENTS_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS))
 
-    cmd = [
-        "docker", "compose", "run", "--rm", "-T", service,
-        "python", "scripts/batch_analyze.py",
-        "--tickers", ",".join(tickers),
-    ]
+    if mode == "docker":
+        cmd = [
+            "docker", "compose", "run", "--rm", "-T", diag["compose_service"],
+            "python", "scripts/batch_analyze.py",
+            "--tickers", ",".join(tickers),
+        ]
+    else:
+        cmd = [diag["python"], "scripts/batch_analyze.py", "--tickers", ",".join(tickers)]
     if trade_date:
         cmd += ["--date", trade_date]
 
@@ -122,14 +202,15 @@ def _handle_tradingagents_analyze(args: dict, **kw) -> str:
         )
     except subprocess.TimeoutExpired:
         return tool_error(
-            f"tradingagents batch run timed out after {timeout_seconds}s for tickers: {', '.join(tickers)}"
+            f"tradingagents run timed out after {timeout_seconds}s for tickers: "
+            f"{', '.join(tickers)} (mode={mode})"
         )
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"Failed to launch docker compose: {type(exc).__name__}: {exc}")
+        return tool_error(f"Failed to launch tradingagents (mode={mode}): {type(exc).__name__}: {exc}")
 
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-40:])
-        return tool_error(f"tradingagents container exited with code {proc.returncode}", output_tail=tail)
+        return tool_error(f"tradingagents process exited with code {proc.returncode} (mode={mode})", output_tail=tail)
 
     payload = None
     for line in reversed(proc.stdout.splitlines()):
@@ -191,7 +272,8 @@ TRADINGAGENTS_ANALYZE_SCHEMA = {
     "name": "tradingagents_analyze",
     "description": (
         "Run the TradingAgents multi-agent LLM research pipeline for one or more "
-        "tickers via its Docker container, and return each ticker's trade decision. "
+        "tickers (via Docker or a local install, per TRADINGAGENTS_EXEC_MODE), and "
+        "return each ticker's trade decision. "
         "Use for stocks (e.g. AAPL, 0700.HK), crypto (e.g. BTC-USD), or any other "
         "Yahoo Finance ticker. If no tickers are given, falls back to the "
         "watchlist configured in the tradingagents dashboard panel (or "

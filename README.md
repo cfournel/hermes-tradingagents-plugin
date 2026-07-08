@@ -3,13 +3,17 @@
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that
 lets Hermes request runs of
 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents)
-— a multi-agent LLM trading research framework — through its Docker
-container, for one or more tickers at a time.
+— a multi-agent LLM trading research framework — for one or more tickers
+at a time, whether your TradingAgents install runs in **Docker** or as a
+**local (non-Docker) checkout**.
 
 TradingAgents' `tradingagents` CLI is interactive-only (it prompts for
 ticker/date/provider), so there's no API for this plugin to call directly.
-Instead it drives `docker compose run` against a small non-interactive
-batch script that must exist in the TradingAgents checkout.
+Instead it runs a small non-interactive batch script that must exist in
+the target checkout, either inside the Docker container or with a plain
+Python interpreter against a local install — see [Reachability](#reachability)
+below for how to point the plugin at whichever one you actually run, and
+how to verify it can actually reach it before relying on a cron job.
 
 ## 0. Install the plugin
 
@@ -33,19 +37,28 @@ Copy `scripts/batch_analyze.py` from this plugin's `reference/` directory
 into your TradingAgents checkout at `scripts/batch_analyze.py` (or apply it
 as a patch if you're tracking the upstream repo). It wraps
 `TradingAgentsGraph.propagate()` for a comma-separated ticker list and
-prints one JSON object to stdout — no changes to `docker-compose.yml` or
-the Dockerfile are needed since the container already has the `tradingagents`
-package and its `scripts/` directory available at `/home/appuser/app`.
+prints one JSON object (including the full multi-section report, not just
+the one-line decision) to stdout.
 
-Sanity check it directly first:
+Sanity check it directly first, matching however you actually run
+TradingAgents:
 
 ```bash
+# Docker
 cd /path/to/TradingAgents
 docker compose run --rm -T tradingagents python scripts/batch_analyze.py \
   --tickers AAPL,NVDA --date 2026-07-06
+
+# Local (no Docker) — use the interpreter TradingAgents is installed in
+cd /path/to/TradingAgents
+/path/to/.venv/bin/python scripts/batch_analyze.py \
+  --tickers AAPL,NVDA --date 2026-07-06
 ```
 
-You should get a single line of JSON: `{"date": "...", "results": [...]}`.
+Either way you should get a single line of JSON:
+`{"date": "...", "results": [...]}`. If that line doesn't print cleanly,
+the plugin won't be able to parse the run's output either — fix it here
+before wiring up the plugin.
 
 ## 2. Enable the plugin
 
@@ -61,14 +74,19 @@ hermes plugins enable tradingagents
 Set these in your Hermes environment (e.g. `~/.hermes/.env`):
 
 ```bash
-TRADINGAGENTS_DIR=/path/to/TradingAgents        # required: has docker-compose.yml + scripts/batch_analyze.py
+TRADINGAGENTS_DIR=/path/to/TradingAgents        # required: has scripts/batch_analyze.py
+TRADINGAGENTS_EXEC_MODE=docker                  # "docker" (default) or "local"
+
+# docker mode only:
 TRADINGAGENTS_COMPOSE_SERVICE=tradingagents     # optional, default shown
+                                                 # `docker` must be on Hermes's PATH and able to reach the daemon
+
+# local mode only:
+TRADINGAGENTS_PYTHON=/path/to/.venv/bin/python  # interpreter TradingAgents is installed in — default "python3" on PATH
+
 TRADINGAGENTS_WATCHLIST=AAPL,NVDA,BTC-USD       # optional: default tickers when the tool is called with none
 TRADINGAGENTS_TIMEOUT_SECONDS=3600              # optional: per-call subprocess timeout
 ```
-
-`docker` must be on Hermes's `PATH` and able to reach the Docker daemon
-(same requirements as running `docker compose` by hand).
 
 ## 4. Use it
 
@@ -78,9 +96,10 @@ Once enabled, the agent has a `tradingagents_analyze` tool:
 tradingagents_analyze(tickers=["AAPL", "NVDA", "BTC-USD"], date="2026-07-06")
 ```
 
-Each ticker runs independently inside the container; a failure on one
-ticker (bad symbol, provider error, etc.) is reported in its own result
-entry and does not fail the whole batch.
+All tickers in one call run inside a single batch invocation (one
+`docker compose run` or one local process, not one per ticker); a failure
+on one ticker (bad symbol, provider error, etc.) is reported in its own
+result entry and does not fail the rest of the batch.
 
 ## 5. Run it daily
 
@@ -112,3 +131,35 @@ Every `tradingagents_analyze` call — cron-triggered or ad hoc — writes its
 result here automatically; there's nothing extra to configure. Reports and
 the watchlist are stored under `~/.hermes/tradingagents/` on the Hermes
 host (not inside the TradingAgents container, which is ephemeral).
+
+The dashboard tab also has a **connectivity status card** at the top — see
+[Reachability](#reachability) below.
+
+## Reachability
+
+"Will `tradingagents_analyze` actually reach TradingAgents?" depends on
+`TRADINGAGENTS_DIR` + `TRADINGAGENTS_EXEC_MODE` matching how you actually
+run it:
+
+| You run TradingAgents via... | Set `TRADINGAGENTS_EXEC_MODE` to... | What the plugin needs to find |
+|---|---|---|
+| `docker compose run ...` (the default) | `docker` (or omit — it's the default) | `docker` on Hermes's `PATH`, a reachable Docker daemon, and `docker-compose.yml` + `scripts/batch_analyze.py` in `TRADINGAGENTS_DIR` |
+| A local venv/conda checkout, no Docker | `local` | `scripts/batch_analyze.py` in `TRADINGAGENTS_DIR`, and `TRADINGAGENTS_PYTHON` resolving to the interpreter TradingAgents is actually installed in |
+
+**Don't guess — check.** Open the TradingAgents dashboard tab: the status
+card at the top reads Reachable/Not reachable, the resolved mode +
+directory, and (if unreachable) exactly what's missing. It calls
+`GET /api/plugins/tradingagents/status`, which runs the exact same check
+`tradingagents_analyze` runs before every call (`tool.py::diagnose()`) —
+so there's no gap between "the card says reachable" and "the tool will
+actually run".
+
+**Same-host assumption.** The plugin runs `subprocess.run(...)` on
+whatever machine Hermes itself runs on, with `cwd=TRADINGAGENTS_DIR` — it
+does not do anything over the network. That means Hermes and TradingAgents
+(Docker or local) need to be **on the same machine**, with `TRADINGAGENTS_DIR`
+being a real local path Hermes's process can `cd` into. Docker's own
+`DOCKER_HOST` can point `docker compose` at a remote daemon if you've set
+that up independently, but this plugin doesn't add any remote-execution
+support (no SSH, no remote Docker context config) — open an issue if you
+need that.

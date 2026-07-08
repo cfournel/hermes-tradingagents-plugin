@@ -16,17 +16,20 @@ subsystems). Instead it loads ``../store.py`` directly by path.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter()
 
-_STORE_FILE = Path(__file__).resolve().parent.parent / "store.py"
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_STORE_FILE = _PLUGIN_ROOT / "store.py"
 _STORE_MODULE_NAME = "hermes_tradingagents_plugin_store"
 
 
@@ -51,6 +54,80 @@ def _validate_date(date: str) -> str:
     if not _DATE_RE.match(date):
         raise HTTPException(status_code=400, detail=f"invalid date: {date!r} (expected YYYY-MM-DD)")
     return date
+
+
+# ---------------------------------------------------------------------------
+# GET /status — connectivity diagnostics ("will tradingagents_analyze
+# actually reach TradingAgents right now?").
+#
+# Deliberately reimplements tool.py's diagnose() rather than importing it:
+# tool.py does `from . import store`, a package-relative import that only
+# resolves when the real plugin loader has registered it as
+# hermes_plugins.tradingagents.tool. Loading it standalone here (the same
+# way store.py is loaded above) would need to fake that package context too
+# — more fragile than the ~20 lines of duplication below. Keep the two in
+# sync if the reachability logic changes.
+# ---------------------------------------------------------------------------
+
+_VALID_EXEC_MODES = {"docker", "local"}
+
+
+def _python_resolvable(python_bin: str) -> bool:
+    if os.sep in python_bin or python_bin.startswith("~") or python_bin.startswith("."):
+        candidate = Path(python_bin).expanduser()
+        return candidate.is_file() and os.access(candidate, os.X_OK)
+    return shutil.which(python_bin) is not None
+
+
+def _diagnose() -> dict[str, Any]:
+    mode = os.environ.get("TRADINGAGENTS_EXEC_MODE", "docker").strip().lower()
+    if mode not in _VALID_EXEC_MODES:
+        mode = "docker"
+
+    raw_dir = os.environ.get("TRADINGAGENTS_DIR", "").strip()
+    info: dict[str, Any] = {"mode": mode, "directory": raw_dir or None}
+    if not raw_dir:
+        info.update(ready=False, detail="TRADINGAGENTS_DIR is not set.")
+        return info
+
+    directory = Path(raw_dir).expanduser()
+    info["directory"] = str(directory)
+    if not directory.is_dir():
+        info.update(ready=False, detail=f"TRADINGAGENTS_DIR does not exist: {directory}")
+        return info
+
+    if not (directory / "scripts" / "batch_analyze.py").is_file():
+        info.update(ready=False, detail=(
+            f"scripts/batch_analyze.py not found under {directory}. Copy it from "
+            "this plugin's reference/ directory into the TradingAgents checkout."
+        ))
+        return info
+
+    if mode == "docker":
+        if not (directory / "docker-compose.yml").is_file():
+            info.update(ready=False, detail=f"No docker-compose.yml found in {directory}.")
+            return info
+        if shutil.which("docker") is None:
+            info.update(ready=False, detail="The 'docker' binary is not on PATH.")
+            return info
+        service = os.environ.get("TRADINGAGENTS_COMPOSE_SERVICE", "tradingagents").strip() or "tradingagents"
+        info.update(ready=True, detail="docker + docker-compose.yml + batch script found.", compose_service=service)
+        return info
+
+    python_bin = os.environ.get("TRADINGAGENTS_PYTHON", "python3").strip() or "python3"
+    if not _python_resolvable(python_bin):
+        info.update(ready=False, detail=(
+            f"Python interpreter not found: {python_bin!r}. Set TRADINGAGENTS_PYTHON "
+            "to the interpreter TradingAgents is installed in."
+        ))
+        return info
+    info.update(ready=True, detail="local python interpreter + batch script found.", python=python_bin)
+    return info
+
+
+@router.get("/status")
+def get_status():
+    return _diagnose()
 
 
 # ---------------------------------------------------------------------------

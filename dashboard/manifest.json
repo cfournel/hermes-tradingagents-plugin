@@ -3,7 +3,7 @@
   "label": "TradingAgents",
   "description": "Multi-symbol TradingAgents runs: edit the watchlist, see the latest decision per security, open the full report",
   "icon": "TrendingUp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "tab": {
     "path": "/tradingagents",
     "position": "end"

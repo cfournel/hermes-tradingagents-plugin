@@ -45,3 +45,15 @@
 .hermes-tradingagents-table tr:last-child td {
   border-bottom: none;
 }
+
+.hermes-tradingagents-status {
+  border-left: 3px solid var(--color-border);
+}
+
+.hermes-tradingagents-status-ok {
+  border-left-color: color-mix(in srgb, #22c55e 60%, var(--color-border));
+}
+
+.hermes-tradingagents-status-bad {
+  border-left-color: color-mix(in srgb, var(--color-destructive, #ef4444) 60%, var(--color-border));
+}
