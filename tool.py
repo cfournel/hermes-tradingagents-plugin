@@ -374,6 +374,7 @@ def run_screen(
 def run_screen_and_analyze(
     asset_classes: List[str], risk: str, horizon: str, limit: int, trade_date: str | None = None,
     on_candidates: "Callable[[list[dict]], None] | None" = None, price_range: str = "all",
+    on_result: "Callable[[list[dict]], None] | None" = None,
 ) -> dict:
     """Stage A (discovery) + stage B (TradingAgents deep dive on the
     shortlist), the full tradingagents_screen pipeline.
@@ -384,6 +385,15 @@ def run_screen_and_analyze(
     "tickers" starts empty since discovery hasn't run yet), so those tickers
     can be shown as busy elsewhere in the UI (e.g. the watchlist's per-ticker
     Run buttons) instead of only the screen job itself looking busy.
+
+    Stage B deep-dives tickers **one at a time** (rather than one batched
+    ``run_batch(tickers, ...)`` call) specifically so ``on_result``, if
+    given, can be called after each ticker finishes with the results
+    accumulated so far — the dashboard uses this to show the screener's
+    table filling in row by row instead of staying empty until every
+    ticker in the shortlist is done. The tradeoff is one docker/local
+    invocation per ticker instead of one for the whole shortlist; negligible
+    next to the minutes a single ticker's multi-agent run itself takes.
     """
     candidates = run_screen(asset_classes, risk, horizon, limit, price_range)
     tickers = [c["ticker"] for c in candidates if c.get("ticker")]
@@ -395,22 +405,35 @@ def run_screen_and_analyze(
     if not tickers:
         return {"candidates": [], "results": []}
 
-    analysis = run_batch(tickers, trade_date, horizon)
-    enriched = []
-    for result in analysis.get("results", []):
-        screen_info = by_ticker.get(result.get("ticker"), {})
-        enriched.append({**result, "screen_source": screen_info.get("source"), "screen_metrics": screen_info.get("metrics")})
+    enriched: list[dict] = []
+    trade_date_out = trade_date
+    for ticker in tickers:
+        try:
+            analysis = run_batch([ticker], trade_date, horizon)
+            trade_date_out = analysis.get("date") or trade_date_out
+            ticker_results = analysis.get("results") or []
+            result = ticker_results[0] if ticker_results else {"ticker": ticker, "error": "no result returned"}
+        except TradingAgentsRunError as exc:
+            result = {"ticker": ticker, "date": trade_date_out, "error": str(exc)}
+        screen_info = by_ticker.get(ticker, {})
+        enriched.append({
+            **result,
+            "screen_source": screen_info.get("source"),
+            "screen_metrics": screen_info.get("metrics"),
+        })
+        if on_result is not None:
+            on_result(list(enriched))
 
     try:
         store.save_screen_run({
             "asset_classes": asset_classes, "risk": risk, "horizon": horizon,
             "price_range": price_range,
-            "date": analysis.get("date"), "results": enriched, "created_at": int(time.time()),
+            "date": trade_date_out, "results": enriched, "created_at": int(time.time()),
         })
     except Exception:
         pass  # dashboard history is best-effort; must not fail the tool call
 
-    return {"date": analysis.get("date"), "candidates": candidates, "results": enriched}
+    return {"date": trade_date_out, "candidates": candidates, "results": enriched}
 
 
 def _handle_tradingagents_screen(args: dict, **kw) -> str:

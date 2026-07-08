@@ -392,12 +392,13 @@
 
     function onRunScreen() {
       setErr(null);
+      setResults([]);
       postScreen({
         asset_classes: assetClasses, risk: risk, horizon: horizon,
         limit: Number(limit) || 10, price_range: priceRange,
       })
         .then(function (result) {
-          setJob({ id: result.job.id, status: result.job.status });
+          setJob({ id: result.job.id, status: result.job.status, total: 0 });
         })
         .catch(function (e) { setErr(parseApiErrorMessage(e)); });
     }
@@ -413,12 +414,20 @@
             return j.status === "queued" || j.status === "running";
           });
           if (active) {
-            setJob({ id: active.id, status: active.status });
+            setJob({ id: active.id, status: active.status, total: (active.tickers || []).length });
+            if (active.result && active.result.results) {
+              setResults(active.result.results);
+            }
           }
         })
         .catch(function () { /* best-effort */ });
     }, []);
 
+    // Stage B deep-dives tickers one at a time server-side, updating
+    // job.result.results after each one finishes — so every poll (not just
+    // the one that sees "done") can pick up newly-finished rows and fill
+    // the table in progressively instead of it staying empty until the
+    // whole shortlist is done.
     useEffect(function () {
       if (!job || job.status === "done" || job.status === "error") {
         return undefined;
@@ -430,14 +439,17 @@
             if (cancelled) return;
             const found = (result.jobs || []).find(function (j) { return j.id === job.id; });
             if (!found) return;
+            const partialResults = (found.result && found.result.results) || null;
+            if (partialResults) {
+              setResults(partialResults);
+            }
             if (found.status === "done") {
               setJob({ id: found.id, status: "done" });
-              setResults((found.result && found.result.results) || []);
             } else if (found.status === "error") {
               setJob({ id: found.id, status: "error" });
               setErr(found.error);
             } else {
-              setJob({ id: found.id, status: found.status });
+              setJob({ id: found.id, status: found.status, total: (found.tickers || []).length });
             }
           })
           .catch(function () { /* transient poll failure — try again next tick */ });
@@ -506,7 +518,11 @@
             size: "sm",
             disabled: running || !assetClasses.length,
             onClick: onRunScreen,
-          }, running ? (job.status === "queued" ? "Queued…" : "Running…") : "Run screen"),
+          }, running
+              ? (job.status === "queued"
+                  ? "Queued…"
+                  : `Running… (${results.length}/${job.total || "?"} analyzed)`)
+              : "Run screen"),
         ),
         err ? h("div", { className: "text-sm text-destructive" }, err) : null,
         h(ScreenResultsTable, { rows: results, onAdded: props.onWatchlistChanged }),

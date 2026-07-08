@@ -228,9 +228,19 @@ def _worker_loop() -> None:
                     with _jobs_lock:
                         _job["tickers"] = [c["ticker"] for c in candidates if c.get("ticker")]
 
+                def _on_result(partial_results, _job=job):
+                    # Update job["result"] as each ticker finishes so pollers
+                    # of GET /screen/status see the table fill in row by row,
+                    # instead of only getting results once the whole
+                    # shortlist is done. Overwritten by the final, complete
+                    # result once run_screen_and_analyze returns below.
+                    with _jobs_lock:
+                        _job["result"] = {"results": partial_results}
+
                 result = tool.run_screen_and_analyze(
                     job["asset_classes"], job["risk"], job["horizon"], job["limit"], job.get("date"),
                     on_candidates=_on_candidates, price_range=job.get("price_range", "all"),
+                    on_result=_on_result,
                 )
             else:
                 result = tool.run_batch(job["tickers"], job.get("date"))
