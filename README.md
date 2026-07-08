@@ -126,11 +126,21 @@ and you'll get a "TradingAgents" tab with:
 - A **last analysis per security** table: date, asset type, decision, and
   an **open report** button that opens the full run report (all analyst,
   research-debate, trading, and risk-management sections) in a new tab.
+- A **Run** button per security, and a **Run all (queued)** button for the
+  whole watchlist — triggers a real `tradingagents_analyze` run directly
+  from the dashboard, no cron job or agent chat needed. Runs take minutes
+  (multi-agent debate per ticker), so these don't block the UI: clicking
+  Run enqueues a job and the row shows Queued/Running until it lands,
+  then the table refreshes itself. All triggered runs — individual or
+  "run all" — share one worker and execute strictly one at a time, so
+  mashing the buttons queues work instead of firing overlapping
+  docker/local invocations at once.
 
-Every `tradingagents_analyze` call — cron-triggered or ad hoc — writes its
-result here automatically; there's nothing extra to configure. Reports and
-the watchlist are stored under `~/.hermes/tradingagents/` on the Hermes
-host (not inside the TradingAgents container, which is ephemeral).
+Every `tradingagents_analyze` call — cron-triggered, dashboard-triggered,
+or ad hoc from agent chat — writes its result here automatically; there's
+nothing extra to configure. Reports and the watchlist are stored under
+`~/.hermes/tradingagents/` on the Hermes host (not inside the
+TradingAgents container, which is ephemeral).
 
 The dashboard tab also has a **connectivity status card** at the top — see
 [Reachability](#reachability) below.

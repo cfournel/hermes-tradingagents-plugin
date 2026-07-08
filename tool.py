@@ -157,28 +157,47 @@ def _parse_tickers(raw: Any) -> List[str]:
     return [t.upper() for t in raw]
 
 
-def _handle_tradingagents_analyze(args: dict, **kw) -> str:
+class TradingAgentsRunError(RuntimeError):
+    """Raised by run_batch() on any failure; carries structured extras
+    (e.g. mode, output_tail) that callers can surface however fits them —
+    tool_error() kwargs for the LLM tool, an HTTPException detail for the
+    dashboard's queued /run endpoint."""
+
+    def __init__(self, message: str, **extra: Any) -> None:
+        super().__init__(message)
+        self.extra = extra
+
+
+def run_batch(tickers: List[str], trade_date: str | None = None) -> dict:
+    """Run one TradingAgents batch invocation for `tickers` and persist
+    results (report + history) via store.py.
+
+    Shared by the tradingagents_analyze tool handler and the dashboard's
+    queued run worker (dashboard/plugin_api.py) — one code path for "how
+    does a batch actually get run", so the two surfaces can't drift.
+
+    Raises TradingAgentsRunError on any failure. Returns the trimmed
+    summary dict (see _persist_and_summarize) on success.
+    """
     diag = diagnose()
     if not diag.get("ready"):
-        return tool_error(
+        raise TradingAgentsRunError(
             diag.get("detail") or "TradingAgents is not reachable — check configuration.",
             mode=diag.get("mode"),
         )
     directory = Path(diag["directory"])
     mode = diag["mode"]
 
-    tickers = _parse_tickers(args.get("tickers"))
     if not tickers:
-        return tool_error(
+        raise TradingAgentsRunError(
             "No tickers given, and no watchlist is configured (dashboard panel "
             "or TRADINGAGENTS_WATCHLIST). Pass tickers explicitly, e.g. "
             "[\"AAPL\", \"NVDA\", \"BTC-USD\"]."
         )
     invalid = [t for t in tickers if not _TICKER_RE.match(t)]
     if invalid:
-        return tool_error(f"Invalid ticker symbol(s): {', '.join(invalid)}")
+        raise TradingAgentsRunError(f"Invalid ticker symbol(s): {', '.join(invalid)}")
 
-    trade_date = str(args.get("date") or "").strip() or None
     timeout_seconds = int(os.environ.get("TRADINGAGENTS_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS))
 
     if mode == "docker":
@@ -201,16 +220,18 @@ def _handle_tradingagents_analyze(args: dict, **kw) -> str:
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-        return tool_error(
+        raise TradingAgentsRunError(
             f"tradingagents run timed out after {timeout_seconds}s for tickers: "
             f"{', '.join(tickers)} (mode={mode})"
         )
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"Failed to launch tradingagents (mode={mode}): {type(exc).__name__}: {exc}")
+        raise TradingAgentsRunError(f"Failed to launch tradingagents (mode={mode}): {type(exc).__name__}: {exc}")
 
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-40:])
-        return tool_error(f"tradingagents process exited with code {proc.returncode} (mode={mode})", output_tail=tail)
+        raise TradingAgentsRunError(
+            f"tradingagents process exited with code {proc.returncode} (mode={mode})", output_tail=tail
+        )
 
     payload = None
     for line in reversed(proc.stdout.splitlines()):
@@ -224,9 +245,19 @@ def _handle_tradingagents_analyze(args: dict, **kw) -> str:
 
     if payload is None:
         tail = "\n".join(proc.stdout.splitlines()[-40:])
-        return tool_error("Could not find JSON output from batch_analyze.py", output_tail=tail)
+        raise TradingAgentsRunError("Could not find JSON output from batch_analyze.py", output_tail=tail)
 
-    return tool_result(_persist_and_summarize(payload))
+    return _persist_and_summarize(payload)
+
+
+def _handle_tradingagents_analyze(args: dict, **kw) -> str:
+    tickers = _parse_tickers(args.get("tickers"))
+    trade_date = str(args.get("date") or "").strip() or None
+    try:
+        result = run_batch(tickers, trade_date)
+    except TradingAgentsRunError as exc:
+        return tool_error(str(exc), **exc.extra)
+    return tool_result(result)
 
 
 def _persist_and_summarize(payload: dict) -> dict:

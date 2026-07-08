@@ -7,19 +7,22 @@ the dashboard's existing session-token auth middleware like every other
 
 This file is imported by path (``importlib.util.spec_from_file_location``)
 as a standalone module with no package context, so it can't use the
-plugin's own package-relative imports (``from . import store`` would need
-``hermes_plugins.tradingagents`` to already be loaded, which isn't
-guaranteed — the tool and the dashboard are loaded by two independent
-subsystems). Instead it loads ``../store.py`` directly by path.
+plugin's own package-relative imports directly. store.py and tool.py both
+get loaded as synthetic submodules of a throwaway package
+(``_PKG_NAME``) rooted at the plugin directory — that's enough for
+tool.py's own ``from . import store`` to resolve normally, so this file
+reuses tool.py's diagnose()/run_batch() instead of re-implementing them.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import os
 import re
-import shutil
 import sys
+import threading
+import time
+import types
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,23 +32,47 @@ from pydantic import BaseModel
 router = APIRouter()
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-_STORE_FILE = _PLUGIN_ROOT / "store.py"
-_STORE_MODULE_NAME = "hermes_tradingagents_plugin_store"
+_PKG_NAME = "hermes_tradingagents_plugin_pkg"
 
 
-def _load_store():
-    if _STORE_MODULE_NAME in sys.modules:
-        return sys.modules[_STORE_MODULE_NAME]
-    spec = importlib.util.spec_from_file_location(_STORE_MODULE_NAME, _STORE_FILE)
+def _ensure_pkg() -> types.ModuleType:
+    if _PKG_NAME not in sys.modules:
+        pkg = types.ModuleType(_PKG_NAME)
+        pkg.__path__ = [str(_PLUGIN_ROOT)]
+        pkg.__package__ = _PKG_NAME
+        sys.modules[_PKG_NAME] = pkg
+    return sys.modules[_PKG_NAME]
+
+
+def _load_sibling(name: str):
+    """Load ``<plugin root>/<name>.py`` as ``_PKG_NAME.<name>``.
+
+    Registering it as an attribute of the synthetic parent package (not
+    just in sys.modules) is required for ``from . import <name>`` inside
+    the loaded module to resolve — Python's relative-import machinery
+    checks ``hasattr(parent_pkg, name)`` before falling back to a real
+    filesystem import, which would fail here since this package doesn't
+    exist on disk.
+    """
+    pkg = _ensure_pkg()
+    full_name = f"{_PKG_NAME}.{name}"
+    if full_name in sys.modules:
+        return sys.modules[full_name]
+    spec = importlib.util.spec_from_file_location(full_name, _PLUGIN_ROOT / f"{name}.py")
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load store module from {_STORE_FILE}")
+        raise ImportError(f"cannot load module from {_PLUGIN_ROOT / f'{name}.py'}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[_STORE_MODULE_NAME] = module
+    module.__package__ = _PKG_NAME
+    sys.modules[full_name] = module
+    setattr(pkg, name, module)
     spec.loader.exec_module(module)
     return module
 
 
-store = _load_store()
+# Load order matters: store must be fully executed before tool, since
+# tool.py's top-level `from . import store` needs it already resolvable.
+store = _load_sibling("store")
+tool = _load_sibling("tool")
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -58,76 +85,13 @@ def _validate_date(date: str) -> str:
 
 # ---------------------------------------------------------------------------
 # GET /status — connectivity diagnostics ("will tradingagents_analyze
-# actually reach TradingAgents right now?").
-#
-# Deliberately reimplements tool.py's diagnose() rather than importing it:
-# tool.py does `from . import store`, a package-relative import that only
-# resolves when the real plugin loader has registered it as
-# hermes_plugins.tradingagents.tool. Loading it standalone here (the same
-# way store.py is loaded above) would need to fake that package context too
-# — more fragile than the ~20 lines of duplication below. Keep the two in
-# sync if the reachability logic changes.
+# actually reach TradingAgents right now?"). Delegates to tool.diagnose(),
+# the same check the tool itself runs before every call.
 # ---------------------------------------------------------------------------
-
-_VALID_EXEC_MODES = {"docker", "local"}
-
-
-def _python_resolvable(python_bin: str) -> bool:
-    if os.sep in python_bin or python_bin.startswith("~") or python_bin.startswith("."):
-        candidate = Path(python_bin).expanduser()
-        return candidate.is_file() and os.access(candidate, os.X_OK)
-    return shutil.which(python_bin) is not None
-
-
-def _diagnose() -> dict[str, Any]:
-    mode = os.environ.get("TRADINGAGENTS_EXEC_MODE", "docker").strip().lower()
-    if mode not in _VALID_EXEC_MODES:
-        mode = "docker"
-
-    raw_dir = os.environ.get("TRADINGAGENTS_DIR", "").strip()
-    info: dict[str, Any] = {"mode": mode, "directory": raw_dir or None}
-    if not raw_dir:
-        info.update(ready=False, detail="TRADINGAGENTS_DIR is not set.")
-        return info
-
-    directory = Path(raw_dir).expanduser()
-    info["directory"] = str(directory)
-    if not directory.is_dir():
-        info.update(ready=False, detail=f"TRADINGAGENTS_DIR does not exist: {directory}")
-        return info
-
-    if not (directory / "scripts" / "batch_analyze.py").is_file():
-        info.update(ready=False, detail=(
-            f"scripts/batch_analyze.py not found under {directory}. Copy it from "
-            "this plugin's reference/ directory into the TradingAgents checkout."
-        ))
-        return info
-
-    if mode == "docker":
-        if not (directory / "docker-compose.yml").is_file():
-            info.update(ready=False, detail=f"No docker-compose.yml found in {directory}.")
-            return info
-        if shutil.which("docker") is None:
-            info.update(ready=False, detail="The 'docker' binary is not on PATH.")
-            return info
-        service = os.environ.get("TRADINGAGENTS_COMPOSE_SERVICE", "tradingagents").strip() or "tradingagents"
-        info.update(ready=True, detail="docker + docker-compose.yml + batch script found.", compose_service=service)
-        return info
-
-    python_bin = os.environ.get("TRADINGAGENTS_PYTHON", "python3").strip() or "python3"
-    if not _python_resolvable(python_bin):
-        info.update(ready=False, detail=(
-            f"Python interpreter not found: {python_bin!r}. Set TRADINGAGENTS_PYTHON "
-            "to the interpreter TradingAgents is installed in."
-        ))
-        return info
-    info.update(ready=True, detail="local python interpreter + batch script found.", python=python_bin)
-    return info
-
 
 @router.get("/status")
 def get_status():
-    return _diagnose()
+    return tool.diagnose()
 
 
 # ---------------------------------------------------------------------------
@@ -206,3 +170,118 @@ def get_report(ticker: str, date: str):
     if content is None:
         raise HTTPException(status_code=404, detail=f"no report for {ticker} on {date}")
     return {"ticker": ticker, "date": date, "content": content}
+
+
+# ---------------------------------------------------------------------------
+# POST /run + GET /run/status — trigger a re-analysis from the dashboard,
+# either for one security or "all" (the whole watchlist). Runs take
+# minutes (multi-agent debate rounds per ticker), so this can't be a
+# synchronous request/response: it enqueues a job on a single background
+# worker thread and returns immediately. The dashboard polls /run/status
+# and refreshes /history once a job finishes.
+#
+# "Queued" runs share one worker (not one thread per click) so an
+# enthusiastic double-click or a "run all" plus a few individual reruns
+# don't pile up N concurrent docker/local invocations fighting over the
+# same LLM rate limits — jobs execute strictly one at a time, in the
+# order submitted.
+# ---------------------------------------------------------------------------
+
+_job_queue: "list[dict[str, Any]]" = []  # FIFO via .pop(0); small N, simplicity over a real Queue
+_jobs_by_id: dict[str, dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+_queue_not_empty = threading.Condition(_jobs_lock)
+_worker_started = False
+_MAX_TRACKED_JOBS = 200
+
+
+def _worker_loop() -> None:
+    while True:
+        with _queue_not_empty:
+            while not _job_queue:
+                _queue_not_empty.wait()
+            job = _job_queue.pop(0)
+            job["status"] = "running"
+            job["started_at"] = time.time()
+
+        try:
+            result = tool.run_batch(job["tickers"], job.get("date"))
+            with _jobs_lock:
+                job["status"] = "done"
+                job["result"] = result
+        except tool.TradingAgentsRunError as exc:
+            with _jobs_lock:
+                job["status"] = "error"
+                job["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — worker must never die
+            with _jobs_lock:
+                job["status"] = "error"
+                job["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            with _jobs_lock:
+                job["finished_at"] = time.time()
+
+
+def _ensure_worker() -> None:
+    global _worker_started
+    with _jobs_lock:
+        if _worker_started:
+            return
+        _worker_started = True
+    threading.Thread(target=_worker_loop, name="tradingagents-run-worker", daemon=True).start()
+
+
+def _prune_jobs_locked() -> None:
+    if len(_jobs_by_id) <= _MAX_TRACKED_JOBS:
+        return
+    for job_id in sorted(_jobs_by_id, key=lambda j: _jobs_by_id[j]["queued_at"])[: len(_jobs_by_id) - _MAX_TRACKED_JOBS]:
+        del _jobs_by_id[job_id]
+
+
+class RunBody(BaseModel):
+    tickers: Optional[list[str]] = None
+    all: bool = False
+    date: Optional[str] = None
+
+
+@router.post("/run")
+def post_run(payload: RunBody):
+    _ensure_worker()
+
+    if payload.all:
+        tickers = store.load_watchlist()
+        if not tickers:
+            raise HTTPException(status_code=400, detail="Watchlist is empty — add tickers first.")
+    else:
+        try:
+            tickers = [store.validate_ticker(t) for t in (payload.tickers or [])]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not tickers:
+            raise HTTPException(status_code=400, detail="tickers is required (or set all=true).")
+
+    job = {
+        "id": uuid.uuid4().hex[:12],
+        "tickers": tickers,
+        "date": payload.date,
+        "status": "queued",
+        "queued_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+        "result": None,
+    }
+    with _queue_not_empty:
+        _jobs_by_id[job["id"]] = job
+        _prune_jobs_locked()
+        _job_queue.append(job)
+        _queue_not_empty.notify()
+
+    return {"job": job}
+
+
+@router.get("/run/status")
+def get_run_status():
+    with _jobs_lock:
+        jobs = sorted(_jobs_by_id.values(), key=lambda j: j["queued_at"], reverse=True)
+    return {"jobs": jobs}
