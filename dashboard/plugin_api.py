@@ -412,18 +412,19 @@ def get_screen_history():
 
 
 # ---------------------------------------------------------------------------
-# GET/POST/DELETE /screen/cron — schedule a recurring tradingagents_screen
-# run at the filters currently selected in the Screener panel. Uses Hermes's
-# own cron subsystem (cron.jobs) directly — this dashboard process already
-# has it importable, same as the built-in Cron page.
+# GET/POST/DELETE /screen/cron and /watchlist/cron — schedule a recurring
+# tradingagents_screen (resp. tradingagents_analyze on the watchlist) run.
+# Uses Hermes's own cron subsystem (cron.jobs) directly — this dashboard
+# process already has it importable, same as the built-in Cron page.
 #
-# At most one screener cron job is tracked at a time, identified by a fixed
-# job name (_SCREENER_CRON_NAME) rather than by ID, so the panel's "does a
-# schedule already exist" toggle doesn't need to remember an ID across a
-# page refresh.
+# At most one job per kind is tracked at a time, identified by a fixed job
+# name (_SCREENER_CRON_NAME / _WATCHLIST_CRON_NAME) rather than by ID, so
+# the panel's "does a schedule already exist" toggle doesn't need to
+# remember an ID across a page refresh.
 # ---------------------------------------------------------------------------
 
 _SCREENER_CRON_NAME = "tradingagents-screener"
+_WATCHLIST_CRON_NAME = "tradingagents-watchlist"
 _CRON_FREQUENCY_SCHEDULES = {
     "daily": "0 9 * * *",
     "weekly": "0 9 * * 1",
@@ -431,11 +432,11 @@ _CRON_FREQUENCY_SCHEDULES = {
 }
 
 
-def _find_screener_cron_job() -> Optional[dict]:
+def _find_cron_job_by_name(name: str) -> Optional[dict]:
     from cron.jobs import list_jobs
 
     for job in list_jobs(include_disabled=True):
-        if job.get("name") == _SCREENER_CRON_NAME:
+        if job.get("name") == name:
             return job
     return None
 
@@ -452,7 +453,7 @@ def _cron_job_summary(job: dict) -> dict:
 
 @router.get("/screen/cron")
 def get_screen_cron():
-    job = _find_screener_cron_job()
+    job = _find_cron_job_by_name(_SCREENER_CRON_NAME)
     if not job:
         return {"exists": False}
     return _cron_job_summary(job)
@@ -471,7 +472,7 @@ class ScreenCronBody(BaseModel):
 def post_screen_cron(payload: ScreenCronBody):
     if payload.frequency not in _CRON_FREQUENCY_SCHEDULES:
         raise HTTPException(status_code=400, detail="frequency must be one of: daily, weekly, monthly")
-    if _find_screener_cron_job():
+    if _find_cron_job_by_name(_SCREENER_CRON_NAME):
         raise HTTPException(status_code=409, detail="A screener cron job already exists — remove it first.")
 
     asset_classes = payload.asset_classes or ["stock"]
@@ -495,9 +496,54 @@ def post_screen_cron(payload: ScreenCronBody):
 
 @router.delete("/screen/cron")
 def delete_screen_cron():
-    job = _find_screener_cron_job()
+    job = _find_cron_job_by_name(_SCREENER_CRON_NAME)
     if not job:
         raise HTTPException(status_code=404, detail="No screener cron job exists.")
+
+    from cron.jobs import remove_job
+
+    remove_job(job["id"])
+    return {"exists": False}
+
+
+@router.get("/watchlist/cron")
+def get_watchlist_cron():
+    job = _find_cron_job_by_name(_WATCHLIST_CRON_NAME)
+    if not job:
+        return {"exists": False}
+    return _cron_job_summary(job)
+
+
+class WatchlistCronBody(BaseModel):
+    frequency: str  # "daily" | "weekly" | "monthly"
+
+
+@router.post("/watchlist/cron")
+def post_watchlist_cron(payload: WatchlistCronBody):
+    if payload.frequency not in _CRON_FREQUENCY_SCHEDULES:
+        raise HTTPException(status_code=400, detail="frequency must be one of: daily, weekly, monthly")
+    if _find_cron_job_by_name(_WATCHLIST_CRON_NAME):
+        raise HTTPException(status_code=409, detail="A watchlist cron job already exists — remove it first.")
+
+    from cron.jobs import create_job
+
+    job = create_job(
+        prompt=(
+            "Run tradingagents_analyze for the configured watchlist and summarize "
+            "each ticker's decision (buy/hold/sell and why) in a short report."
+        ),
+        schedule=_CRON_FREQUENCY_SCHEDULES[payload.frequency],
+        name=_WATCHLIST_CRON_NAME,
+        deliver="local",
+    )
+    return _cron_job_summary(job)
+
+
+@router.delete("/watchlist/cron")
+def delete_watchlist_cron():
+    job = _find_cron_job_by_name(_WATCHLIST_CRON_NAME)
+    if not job:
+        raise HTTPException(status_code=404, detail="No watchlist cron job exists.")
 
     from cron.jobs import remove_job
 

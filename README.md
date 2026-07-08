@@ -204,6 +204,12 @@ and you'll get a "TradingAgents" tab with:
   "run all" — share one worker and execute strictly one at a time, so
   mashing the buttons queues work instead of firing overlapping
   docker/local invocations at once.
+- Next to "Run all (queued)": a frequency dropdown (daily/weekly/monthly)
+  and a **"Schedule watchlist"** button — same cron-scheduling mechanism as
+  the Screener's (see step 6), creating a `tradingagents_analyze` cron job
+  for the whole watchlist instead of a one-off `hermes cron create`. Only
+  one watchlist cron job is tracked at a time; once one exists the button
+  grays out and a "Remove schedule" button appears next to it.
 - A **Screener** panel (see step 6): pick risk / asset class(es) / horizon,
   run a screen, and add any result to the watchlist with one click (or all
   of them at once). Shares the same worker queue as Run/Run all, so a

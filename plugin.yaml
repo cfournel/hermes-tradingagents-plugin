@@ -1,5 +1,5 @@
 name: tradingagents
-version: 1.5.1
+version: 1.6.0
 description: "Run TauricResearch/TradingAgents (multi-agent LLM trading research) for one or more tickers, via Docker or a local checkout. Adds tradingagents_analyze, driven ad hoc, from a daily hermes cron schedule, or straight from the dashboard's Run / Run all (queued) buttons, plus tradingagents_screen to discover new candidates (Yahoo Finance screener / CoinGecko / a static futures list) by risk level, asset class, and trade horizon before deep-diving the shortlist. Ships a dashboard panel for the watchlist, screener, last-analysis history, full reports, and a connectivity status card."
 author: cfournel
 kind: standalone

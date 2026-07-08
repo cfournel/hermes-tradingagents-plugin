@@ -105,6 +105,22 @@
     return SDK.fetchJSON(`${API}/screen/cron`, { method: "DELETE" });
   }
 
+  function fetchWatchlistCron() {
+    return SDK.fetchJSON(`${API}/watchlist/cron`);
+  }
+
+  function postWatchlistCron(body) {
+    return SDK.fetchJSON(`${API}/watchlist/cron`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function deleteWatchlistCron() {
+    return SDK.fetchJSON(`${API}/watchlist/cron`, { method: "DELETE" });
+  }
+
   const RUN_POLL_INTERVAL_MS = 3000;
   const ASSET_CLASSES = ["stock", "crypto", "commodity"];
   const SCREENER_FILTERS_STORAGE_KEY = "hermes-tradingagents-screener-filters";
@@ -665,6 +681,47 @@
     const [screenJobs, setScreenJobs] = useState({});
     const [runErr, setRunErr] = useState(null);
 
+    const [watchlistCronJob, setWatchlistCronJob] = useState(null); // null while loading; {} shape once known: {exists, schedule, ...}
+    const [watchlistCronFrequency, setWatchlistCronFrequency] = useState("daily");
+    const [watchlistCronBusy, setWatchlistCronBusy] = useState(false);
+    const [watchlistCronErr, setWatchlistCronErr] = useState(null);
+
+    const loadWatchlistCronStatus = useCallback(function () {
+      fetchWatchlistCron()
+        .then(function (result) { setWatchlistCronJob(result); })
+        .catch(function () { setWatchlistCronJob({ exists: false }); });
+    }, []);
+
+    useEffect(function () { loadWatchlistCronStatus(); }, [loadWatchlistCronStatus]);
+
+    function onCreateWatchlistCron() {
+      setWatchlistCronBusy(true);
+      setWatchlistCronErr(null);
+      postWatchlistCron({ frequency: watchlistCronFrequency })
+        .then(function (result) {
+          setWatchlistCronBusy(false);
+          setWatchlistCronJob(result);
+        })
+        .catch(function (e) {
+          setWatchlistCronBusy(false);
+          setWatchlistCronErr(parseApiErrorMessage(e));
+        });
+    }
+
+    function onDeleteWatchlistCron() {
+      setWatchlistCronBusy(true);
+      setWatchlistCronErr(null);
+      deleteWatchlistCron()
+        .then(function () {
+          setWatchlistCronBusy(false);
+          setWatchlistCronJob({ exists: false });
+        })
+        .catch(function (e) {
+          setWatchlistCronBusy(false);
+          setWatchlistCronErr(parseApiErrorMessage(e));
+        });
+    }
+
     const load = useCallback(function () {
       setLoading(true);
       setLoadErr(null);
@@ -859,11 +916,37 @@
             onClick: onRunAll,
             disabled: anyRunActive || !tickers.length,
           }, allRunActive ? "Running all…" : anyRunActive ? "Analysis running…" : "Run all (queued)"),
+          h("select", {
+            value: watchlistCronFrequency,
+            disabled: watchlistCronBusy || (watchlistCronJob && watchlistCronJob.exists),
+            onChange: function (e) { setWatchlistCronFrequency(e.target.value); },
+          },
+            CRON_FREQUENCIES.map(function (f) {
+              return h("option", { key: f.value, value: f.value }, f.label);
+            }),
+          ),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            disabled: watchlistCronBusy || !watchlistCronJob || watchlistCronJob.exists,
+            onClick: onCreateWatchlistCron,
+          }, watchlistCronJob && watchlistCronJob.exists
+              ? `Scheduled (${watchlistCronJob.schedule || watchlistCronFrequency})`
+              : "Schedule watchlist"),
+          (watchlistCronJob && watchlistCronJob.exists)
+            ? h(Button, {
+                size: "sm",
+                variant: "outline",
+                disabled: watchlistCronBusy,
+                onClick: onDeleteWatchlistCron,
+              }, "Remove schedule")
+            : null,
           h(Button, { size: "sm", variant: "outline", onClick: load, disabled: loading },
             loading ? "Loading…" : "Refresh"),
         ),
       ),
       loadErr ? h("div", { className: "text-sm text-destructive" }, loadErr) : null,
+      watchlistCronErr ? h("div", { className: "text-sm text-destructive" }, watchlistCronErr) : null,
       runErr
         ? h("pre", {
             className: "text-sm text-destructive hermes-tradingagents-run-error",
