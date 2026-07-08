@@ -1,0 +1,8 @@
+name: tradingagents
+version: 1.0.0
+description: "Run TauricResearch/TradingAgents (multi-agent LLM trading research) for one or more tickers via its Docker container. Adds tradingagents_analyze, driven ad hoc or on a daily hermes cron schedule."
+author: NousResearch
+kind: standalone
+requires_env: []
+provides_tools:
+  - tradingagents_analyze
