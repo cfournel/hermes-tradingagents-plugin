@@ -14,12 +14,18 @@ batch script that must exist in the TradingAgents checkout.
 ## 0. Install the plugin
 
 ```bash
-hermes plugins install cfournel/hermes-tradingagents-plugin --enable
+hermes plugins install git@github.com:cfournel/hermes-tradingagents-plugin.git --enable
 ```
 
-This clones the repo into `~/.hermes/plugins/hermes-tradingagents-plugin/`.
-(`hermes plugins list` / `hermes plugins enable|disable` manage it from
-there like any other installed plugin.)
+(The `owner/repo` shorthand tries an HTTPS clone, which fails with
+`could not read Username for 'https://github.com'` if you don't have an
+HTTPS credential helper configured — use the full SSH URL above if that
+happens, assuming you have `gh`/git SSH auth set up.)
+
+This clones the repo into `~/.hermes/plugins/tradingagents/` (the plugin's
+manifest `name`, not the repo name). `hermes plugins list` /
+`hermes plugins enable|disable|update` manage it from there like any other
+installed plugin.
 
 ## 1. Add the batch script to TradingAgents
 
@@ -86,5 +92,23 @@ hermes cron create "0 9 * * *" \
   --name daily-tradingagents
 ```
 
-Leave `tickers` out of the prompt to fall back to `TRADINGAGENTS_WATCHLIST`,
-or name specific symbols in the cron prompt itself.
+Leave `tickers` out of the prompt to fall back to the watchlist (dashboard
+panel if you've saved one there, else `TRADINGAGENTS_WATCHLIST`), or name
+specific symbols in the cron prompt itself.
+
+## 6. Dashboard panel
+
+The plugin ships a dashboard tab (`dashboard/`) — open `hermes dashboard`
+and you'll get a "TradingAgents" tab with:
+
+- A **watchlist editor** (one ticker per line): saves to the same watchlist
+  `tradingagents_analyze` reads when called with no explicit tickers, so
+  editing it here changes what the daily cron job covers.
+- A **last analysis per security** table: date, asset type, decision, and
+  an **open report** button that opens the full run report (all analyst,
+  research-debate, trading, and risk-management sections) in a new tab.
+
+Every `tradingagents_analyze` call — cron-triggered or ad hoc — writes its
+result here automatically; there's nothing extra to configure. Reports and
+the watchlist are stored under `~/.hermes/tradingagents/` on the Hermes
+host (not inside the TradingAgents container, which is ephemeral).

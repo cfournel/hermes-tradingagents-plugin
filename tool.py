@@ -15,9 +15,15 @@ Config (environment variables, e.g. in ~/.hermes/.env or the process env):
                                      scripts/batch_analyze.py. Required.
     TRADINGAGENTS_COMPOSE_SERVICE   Compose service to run. Default: "tradingagents".
     TRADINGAGENTS_WATCHLIST         Comma-separated default tickers used when
-                                     the tool is called without `tickers`
-                                     (handy for a daily `hermes cron` job).
+                                     the tool is called without `tickers` AND
+                                     no watchlist has been saved yet via the
+                                     dashboard panel (see dashboard/). Once a
+                                     dashboard watchlist exists, it wins.
     TRADINGAGENTS_TIMEOUT_SECONDS   Per-call subprocess timeout. Default: 3600.
+
+Every run (success or failure, dashboard-triggered or not) is recorded via
+``store.py`` so the dashboard panel can show the latest decision per ticker
+and link to the full report — see ``dashboard/plugin_api.py``.
 """
 
 from __future__ import annotations
@@ -27,10 +33,13 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, List
 
 from tools.registry import tool_error, tool_result
+
+from . import store
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-^=]{1,32}$")
 _DEFAULT_TIMEOUT_SECONDS = 3600
@@ -52,8 +61,13 @@ def _check_tradingagents_available() -> bool:
 
 def _parse_tickers(raw: Any) -> List[str]:
     if raw is None:
-        watchlist = os.environ.get("TRADINGAGENTS_WATCHLIST", "")
-        raw = [item.strip() for item in watchlist.split(",") if item.strip()]
+        # Dashboard-saved watchlist wins when present; otherwise fall back
+        # to the env var (bootstrap path for users who haven't opened the
+        # dashboard yet).
+        raw = store.load_watchlist()
+        if not raw:
+            watchlist = os.environ.get("TRADINGAGENTS_WATCHLIST", "")
+            raw = [item.strip() for item in watchlist.split(",") if item.strip()]
     elif isinstance(raw, str):
         raw = [item.strip() for item in raw.split(",") if item.strip()]
     elif isinstance(raw, list):
@@ -78,8 +92,9 @@ def _handle_tradingagents_analyze(args: dict, **kw) -> str:
     tickers = _parse_tickers(args.get("tickers"))
     if not tickers:
         return tool_error(
-            "No tickers given and TRADINGAGENTS_WATCHLIST is not set. "
-            "Pass tickers explicitly, e.g. [\"AAPL\", \"NVDA\", \"BTC-USD\"]."
+            "No tickers given, and no watchlist is configured (dashboard panel "
+            "or TRADINGAGENTS_WATCHLIST). Pass tickers explicitly, e.g. "
+            "[\"AAPL\", \"NVDA\", \"BTC-USD\"]."
         )
     invalid = [t for t in tickers if not _TICKER_RE.match(t)]
     if invalid:
@@ -130,7 +145,46 @@ def _handle_tradingagents_analyze(args: dict, **kw) -> str:
         tail = "\n".join(proc.stdout.splitlines()[-40:])
         return tool_error("Could not find JSON output from batch_analyze.py", output_tail=tail)
 
-    return tool_result(payload)
+    return tool_result(_persist_and_summarize(payload))
+
+
+def _persist_and_summarize(payload: dict) -> dict:
+    """Save each result's full report + a history entry, and return a
+    trimmed summary (no report bodies) for the LLM's tool-result context.
+
+    The full report is large (multiple analyst + debate transcripts) and
+    already saved to disk for the dashboard's "open full report" link, so
+    there's no reason to duplicate it into the agent's context window.
+    """
+    now = int(time.time())
+    summarized = []
+    for result in payload.get("results", []):
+        ticker = result.get("ticker")
+        date = result.get("date")
+        entry = {
+            "ticker": ticker,
+            "date": date,
+            "created_at": now,
+            "asset_type": result.get("asset_type"),
+            "decision": result.get("decision"),
+            "error": result.get("error"),
+        }
+        report_text = result.get("report")
+        if ticker and date and report_text:
+            try:
+                store.save_report(ticker, date, report_text)
+                entry["has_report"] = True
+            except Exception:
+                entry["has_report"] = False
+        else:
+            entry["has_report"] = False
+        try:
+            store.append_history(entry)
+        except Exception:
+            pass  # dashboard history is best-effort; must not fail the tool call
+        summarized.append({k: v for k, v in entry.items() if k != "created_at"})
+
+    return {"date": payload.get("date"), "results": summarized}
 
 
 TRADINGAGENTS_ANALYZE_SCHEMA = {
@@ -140,7 +194,9 @@ TRADINGAGENTS_ANALYZE_SCHEMA = {
         "tickers via its Docker container, and return each ticker's trade decision. "
         "Use for stocks (e.g. AAPL, 0700.HK), crypto (e.g. BTC-USD), or any other "
         "Yahoo Finance ticker. If no tickers are given, falls back to the "
-        "TRADINGAGENTS_WATCHLIST configured on the host."
+        "watchlist configured in the tradingagents dashboard panel (or "
+        "TRADINGAGENTS_WATCHLIST if no dashboard watchlist is saved yet). "
+        "Each result is saved for the dashboard's history view and full-report link."
     ),
     "parameters": {
         "type": "object",

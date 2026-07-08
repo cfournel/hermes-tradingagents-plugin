@@ -16,12 +16,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from datetime import date
+from pathlib import Path
 
 from cli.models import AnalystType
 from cli.utils import detect_asset_type, filter_analysts_for_asset_type
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.reporting import write_report_tree
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,12 +52,27 @@ def analyze_one(ticker: str, trade_date: str, debug: bool) -> dict:
         debug=debug,
         config=config,
     )
-    _, decision = graph.propagate(ticker, trade_date, asset_type=asset_type.value)
+    final_state, decision = graph.propagate(ticker, trade_date, asset_type=asset_type.value)
+
+    # Render the same consolidated markdown report the interactive CLI
+    # writes to disk, so callers get more than the one-line decision
+    # without having to reassemble final_state themselves. Written to a
+    # throwaway directory since the caller only wants the string back
+    # (the container is typically ephemeral, `docker compose run --rm`).
+    report_markdown = None
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report_file = write_report_tree(final_state, ticker, Path(tmp_dir))
+            report_markdown = report_file.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - report rendering must not fail the run
+        report_markdown = f"(failed to render full report: {type(exc).__name__}: {exc})"
+
     return {
         "ticker": ticker,
         "date": trade_date,
         "asset_type": asset_type.value,
         "decision": decision,
+        "report": report_markdown,
     }
 
 
