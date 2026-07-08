@@ -52,7 +52,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Callable, List
 
 from tools.registry import tool_error, tool_result
 
@@ -370,12 +370,24 @@ def run_screen(asset_classes: List[str], risk: str, horizon: str, limit: int = 2
 
 def run_screen_and_analyze(
     asset_classes: List[str], risk: str, horizon: str, limit: int, trade_date: str | None = None,
+    on_candidates: "Callable[[list[dict]], None] | None" = None,
 ) -> dict:
     """Stage A (discovery) + stage B (TradingAgents deep dive on the
-    shortlist), the full tradingagents_screen pipeline."""
+    shortlist), the full tradingagents_screen pipeline.
+
+    ``on_candidates``, if given, is called once stage A resolves the
+    shortlist and before stage B starts — the dashboard's queued worker uses
+    it to record which tickers a screen job is about to deep-dive (job
+    "tickers" starts empty since discovery hasn't run yet), so those tickers
+    can be shown as busy elsewhere in the UI (e.g. the watchlist's per-ticker
+    Run buttons) instead of only the screen job itself looking busy.
+    """
     candidates = run_screen(asset_classes, risk, horizon, limit)
     tickers = [c["ticker"] for c in candidates if c.get("ticker")]
     by_ticker = {c["ticker"]: c for c in candidates if c.get("ticker")}
+
+    if on_candidates is not None:
+        on_candidates(candidates)
 
     if not tickers:
         return {"candidates": [], "results": []}

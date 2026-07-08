@@ -219,8 +219,18 @@ def _worker_loop() -> None:
 
         try:
             if job.get("kind") == "screen":
+                def _on_candidates(candidates, _job=job):
+                    # job["tickers"] starts empty — stage A hasn't run yet
+                    # when the job is created. Filling it in once discovery
+                    # resolves lets the watchlist's per-ticker Run buttons
+                    # (which only know about job["tickers"], not job kind)
+                    # show these tickers as busy during stage B too.
+                    with _jobs_lock:
+                        _job["tickers"] = [c["ticker"] for c in candidates if c.get("ticker")]
+
                 result = tool.run_screen_and_analyze(
                     job["asset_classes"], job["risk"], job["horizon"], job["limit"], job.get("date"),
+                    on_candidates=_on_candidates,
                 )
             else:
                 result = tool.run_batch(job["tickers"], job.get("date"))

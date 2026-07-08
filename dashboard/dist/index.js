@@ -505,6 +505,12 @@
     // the source of truth for "is anything running" is the poll below, this
     // is just which job ids we're waiting on.
     const [jobs, setJobs] = useState({});
+    // screenJobs: jobId -> { tickers: string[], status } — a running screen
+    // job's stage B deep-dives tickers too, via run_batch, but *outside* the
+    // /run endpoint (the worker calls it directly), so those tickers never
+    // show up in `jobs` above. Tracked separately here so the watchlist's
+    // per-ticker Run buttons (and Run all) gray out for them as well.
+    const [screenJobs, setScreenJobs] = useState({});
     const [runErr, setRunErr] = useState(null);
 
     const load = useCallback(function () {
@@ -588,22 +594,83 @@
       };
     }, [jobs, load]);
 
+    // Sync + poll screen jobs the same way as analyze jobs above, so the
+    // watchlist table's per-ticker Run buttons (and Run all) also gray out
+    // while a screen's stage B is deep-diving them. Unlike analyze jobs,
+    // a screen job's ticker list starts empty and fills in mid-run (stage A
+    // discovery happens inside the worker), so every poll re-reads tickers,
+    // not just status.
+    useEffect(function () {
+      fetchScreenStatus()
+        .then(function (result) {
+          const active = {};
+          (result.jobs || []).forEach(function (j) {
+            if (j.status === "queued" || j.status === "running") {
+              active[j.id] = { tickers: j.tickers || [], status: j.status };
+            }
+          });
+          if (Object.keys(active).length) {
+            setScreenJobs(function (prev) { return Object.assign({}, active, prev); });
+          }
+        })
+        .catch(function () { /* best-effort */ });
+    }, []);
+
+    useEffect(function () {
+      if (!Object.keys(screenJobs).length) {
+        return undefined;
+      }
+      let cancelled = false;
+      const interval = setInterval(function () {
+        fetchScreenStatus()
+          .then(function (result) {
+            if (cancelled) return;
+            const byId = {};
+            (result.jobs || []).forEach(function (j) { byId[j.id] = j; });
+            let anyFinished = false;
+            setScreenJobs(function (prev) {
+              const next = {};
+              Object.keys(prev).forEach(function (id) {
+                const server = byId[id];
+                if (!server || server.status === "done" || server.status === "error") {
+                  anyFinished = true;
+                  return;
+                }
+                next[id] = { tickers: server.tickers || [], status: server.status };
+              });
+              return next;
+            });
+            if (anyFinished) load();
+          })
+          .catch(function () { /* transient poll failure — try again next tick */ });
+      }, RUN_POLL_INTERVAL_MS);
+      return function () {
+        cancelled = true;
+        clearInterval(interval);
+      };
+    }, [screenJobs, load]);
+
     const activeTickers = useMemo(function () {
       const map = {};
       Object.keys(jobs).forEach(function (id) {
         const job = jobs[id];
         job.tickers.forEach(function (t) { map[t] = job.status; });
       });
+      Object.keys(screenJobs).forEach(function (id) {
+        const job = screenJobs[id];
+        job.tickers.forEach(function (t) { map[t] = job.status; });
+      });
       return map;
-    }, [jobs]);
+    }, [jobs, screenJobs]);
 
-    // Any job in flight — individual or "all" — disables Run all: the worker
-    // processes one job at a time, so queuing another just piles up behind
-    // whatever's already running, and graying the button makes that visible
-    // instead of inviting a confusing extra click.
+    // Any job in flight — individual, "all", or a screen's deep-dive — disables
+    // Run all: analyze and screen jobs share the same single worker, so
+    // queuing another just piles up behind whatever's already running, and
+    // graying the button makes that visible instead of inviting a confusing
+    // extra click.
     const anyRunActive = useMemo(function () {
-      return Object.keys(jobs).length > 0;
-    }, [jobs]);
+      return Object.keys(jobs).length > 0 || Object.keys(screenJobs).length > 0;
+    }, [jobs, screenJobs]);
 
     const allRunActive = useMemo(function () {
       return Object.keys(jobs).some(function (id) { return jobs[id].isAll; });
