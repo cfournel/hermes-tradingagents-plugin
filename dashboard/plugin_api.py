@@ -230,7 +230,7 @@ def _worker_loop() -> None:
 
                 result = tool.run_screen_and_analyze(
                     job["asset_classes"], job["risk"], job["horizon"], job["limit"], job.get("date"),
-                    on_candidates=_on_candidates,
+                    on_candidates=_on_candidates, price_range=job.get("price_range", "all"),
                 )
             else:
                 result = tool.run_batch(job["tickers"], job.get("date"))
@@ -335,11 +335,15 @@ def get_run_status():
 # overlapping docker/local invocations.
 # ---------------------------------------------------------------------------
 
+_VALID_PRICE_RANGES = ("all", "pennies", "5_50", "51_100", "101_300", "301_plus")
+
+
 class ScreenBody(BaseModel):
     asset_classes: Optional[list[str]] = None
     risk: str = "medium"
     horizon: str = "position"
     limit: int = 10
+    price_range: str = "all"
     date: Optional[str] = None
 
 
@@ -352,6 +356,8 @@ def post_screen(payload: ScreenBody):
         raise HTTPException(status_code=400, detail="risk must be one of: low, medium, high")
     if payload.horizon not in ("swing", "position"):
         raise HTTPException(status_code=400, detail="horizon must be one of: swing, position")
+    if payload.price_range not in _VALID_PRICE_RANGES:
+        raise HTTPException(status_code=400, detail=f"price_range must be one of: {', '.join(_VALID_PRICE_RANGES)}")
 
     job = {
         "id": uuid.uuid4().hex[:12],
@@ -360,6 +366,7 @@ def post_screen(payload: ScreenBody):
         "risk": payload.risk,
         "horizon": payload.horizon,
         "limit": payload.limit,
+        "price_range": payload.price_range,
         "date": payload.date,
         "tickers": [],  # screen jobs discover their own tickers; kept for UI symmetry with analyze jobs
         "status": "queued",

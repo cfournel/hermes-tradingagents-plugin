@@ -128,7 +128,7 @@ already know which tickers you care about. `tradingagents_screen` is for
 the opposite case — "find me something new":
 
 ```
-tradingagents_screen(asset_classes=["stock", "crypto"], risk="medium", horizon="position", limit=10)
+tradingagents_screen(asset_classes=["stock", "crypto"], risk="medium", horizon="position", limit=10, price_range="5_50")
 ```
 
 It runs in two stages:
@@ -149,9 +149,11 @@ It runs in two stages:
    alongside the screen metrics that surfaced it.
 
 `risk` is `low` / `medium` / `high`. `horizon` is `swing` (a quick trade,
-a few days) or `position` (a hold, multi-month trend). `limit` caps
-candidates *per asset class* before the deep dive — keep this small (5–15);
-each candidate costs a full multi-agent run in stage 2.
+a few days) or `position` (a hold, multi-month trend). `price_range` filters
+by current price: `all`, `pennies` (under $5), `5_50`, `51_100`, `101_300`,
+or `301_plus`. `limit` caps candidates *per asset class* before the deep
+dive — keep this small (5–15); each candidate costs a full multi-agent run
+in stage 2.
 
 **Two discovery paths, automatic fallback:**
 

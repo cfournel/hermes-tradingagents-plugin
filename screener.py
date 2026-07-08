@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 VALID_RISK_LEVELS = {"low", "medium", "high"}
 VALID_HORIZONS = {"swing", "position"}
 VALID_ASSET_CLASSES = {"stock", "crypto", "commodity"}
+VALID_PRICE_RANGES = {"all", "pennies", "5_50", "51_100", "101_300", "301_plus"}
+
+# (min, max) price bounds per range — None means unbounded on that side.
+# "pennies" is everything below the next band's floor (5), matching the
+# common "penny stock" cutoff.
+_PRICE_BOUNDS: dict[str, tuple[float | None, float | None]] = {
+    "all": (None, None),
+    "pennies": (None, 5),
+    "5_50": (5, 50),
+    "51_100": (51, 100),
+    "101_300": (101, 300),
+    "301_plus": (301, None),
+}
+
+
+def _price_bounds(price_range: str) -> tuple[float | None, float | None]:
+    return _PRICE_BOUNDS[price_range]
+
 
 _COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
@@ -58,7 +76,9 @@ def _equity_beta_bounds(risk: str) -> tuple[float, float]:
     }[risk]
 
 
-def screen_equities(risk: str, horizon: str, limit: int = 20) -> list[dict[str, Any]]:
+def screen_equities(
+    risk: str, horizon: str, limit: int = 20, price_range: str = "all",
+) -> list[dict[str, Any]]:
     try:
         import yfinance as yf
         from yfinance import EquityQuery
@@ -69,12 +89,19 @@ def screen_equities(risk: str, horizon: str, limit: int = 20) -> list[dict[str, 
     beta_lo, beta_hi = _equity_beta_bounds(risk)
     sort_field = "percentchange" if horizon == "swing" else "fiftytwowkpercentchange"
 
-    query = EquityQuery("and", [
+    conditions = [
         EquityQuery("eq", ["region", "us"]),
         EquityQuery("btwn", ["beta", beta_lo, beta_hi]),
         EquityQuery("gte", ["intradaymarketcap", 300_000_000]),
         EquityQuery("gt", ["dayvolume", 100_000]),
-    ])
+    ]
+    price_lo, price_hi = _price_bounds(price_range)
+    if price_lo is not None:
+        conditions.append(EquityQuery("gte", ["intradayprice", price_lo]))
+    if price_hi is not None:
+        conditions.append(EquityQuery("lte", ["intradayprice", price_hi]))
+    query = EquityQuery("and", conditions)
+
     try:
         result = yf.screen(query, sortField=sort_field, sortAsc=False, size=limit)
     except Exception as exc:  # noqa: BLE001 — a screener outage shouldn't crash discovery
@@ -96,6 +123,7 @@ def screen_equities(risk: str, horizon: str, limit: int = 20) -> list[dict[str, 
                 "fifty_two_week_change": q.get("fiftyTwoWeekChangePercent"),
                 "market_cap": q.get("marketCap"),
                 "sector": q.get("sector"),
+                "price": q.get("regularMarketPrice"),
             },
         })
     return candidates
@@ -109,10 +137,13 @@ def _coingecko_risk_bounds(risk: str) -> tuple[int, int]:
     }[risk]
 
 
-def screen_crypto(risk: str, horizon: str, limit: int = 20) -> list[dict[str, Any]]:
+def screen_crypto(
+    risk: str, horizon: str, limit: int = 20, price_range: str = "all",
+) -> list[dict[str, Any]]:
     import requests
 
     min_rank, max_rank = _coingecko_risk_bounds(risk)
+    price_lo, price_hi = _price_bounds(price_range)
     change_field = "price_change_percentage_24h_in_currency" if horizon == "swing" \
         else "price_change_percentage_7d_in_currency"
 
@@ -145,9 +176,14 @@ def screen_crypto(risk: str, horizon: str, limit: int = 20) -> list[dict[str, An
     banded.sort(key=lambda c: c[change_field], reverse=True)
 
     candidates = []
-    for c in banded[:limit]:
+    for c in banded:
         symbol = c.get("symbol")
-        if not symbol:
+        price = c.get("current_price")
+        if not symbol or price is None:
+            continue
+        if price_lo is not None and price < price_lo:
+            continue
+        if price_hi is not None and price > price_hi:
             continue
         candidates.append({
             "ticker": f"{symbol.upper()}-USD",
@@ -158,14 +194,20 @@ def screen_crypto(risk: str, horizon: str, limit: int = 20) -> list[dict[str, An
                 "price_change_24h_pct": c.get("price_change_percentage_24h_in_currency"),
                 "price_change_7d_pct": c.get("price_change_percentage_7d_in_currency"),
                 "market_cap": c.get("market_cap"),
+                "price": price,
             },
         })
+        if len(candidates) >= limit:
+            break
     return candidates
 
 
-def screen_commodities(risk: str, horizon: str, limit: int = 20) -> list[dict[str, Any]]:
+def screen_commodities(
+    risk: str, horizon: str, limit: int = 20, price_range: str = "all",
+) -> list[dict[str, Any]]:
     tier_universe = [c for c in COMMODITY_UNIVERSE if c["risk_tier"] == risk]
     period = "5d" if horizon == "swing" else "6mo"
+    price_lo, price_hi = _price_bounds(price_range)
 
     try:
         import yfinance as yf
@@ -185,23 +227,24 @@ def screen_commodities(risk: str, horizon: str, limit: int = 20) -> list[dict[st
             close_0 = hist["Close"].iloc[0]
             if not close_0 or close_0 != close_0:  # zero or NaN (NaN != NaN)
                 continue
-            pct_change = (hist["Close"].iloc[-1] / close_0 - 1) * 100
+            price = float(hist["Close"].iloc[-1])
+            pct_change = (price / close_0 - 1) * 100
         except Exception as exc:  # noqa: BLE001
             logger.warning("commodity screen: failed to fetch %s: %s", c["ticker"], exc)
+            continue
+        if price_lo is not None and price < price_lo:
+            continue
+        if price_hi is not None and price > price_hi:
             continue
         scored.append({
             "ticker": c["ticker"],
             "asset_type": "commodity",
             "source": "yfinance_history",
-            "metrics": {"name": c["name"], "percent_change": round(float(pct_change), 2)},
+            "metrics": {"name": c["name"], "percent_change": round(pct_change, 2), "price": round(price, 2)},
         })
 
     scored.sort(key=lambda x: x["metrics"]["percent_change"], reverse=True)
-    return scored[:limit] if scored else [
-        {"ticker": c["ticker"], "asset_type": "commodity", "source": "static_list",
-         "metrics": {"name": c["name"]}}
-        for c in tier_universe[:limit]
-    ]
+    return scored[:limit] if scored else []
 
 
 def discover(
@@ -209,11 +252,14 @@ def discover(
     risk: str,
     horizon: str,
     limit: int = 20,
+    price_range: str = "all",
 ) -> list[dict[str, Any]]:
     if risk not in VALID_RISK_LEVELS:
         raise ValueError(f"risk must be one of {sorted(VALID_RISK_LEVELS)}, got {risk!r}")
     if horizon not in VALID_HORIZONS:
         raise ValueError(f"horizon must be one of {sorted(VALID_HORIZONS)}, got {horizon!r}")
+    if price_range not in VALID_PRICE_RANGES:
+        raise ValueError(f"price_range must be one of {sorted(VALID_PRICE_RANGES)}, got {price_range!r}")
     invalid_classes = set(asset_classes) - VALID_ASSET_CLASSES
     if invalid_classes:
         raise ValueError(f"invalid asset class(es): {sorted(invalid_classes)}")
@@ -221,9 +267,9 @@ def discover(
     results: list[dict[str, Any]] = []
     for asset_class in asset_classes:
         if asset_class == "stock":
-            results.extend(screen_equities(risk, horizon, limit))
+            results.extend(screen_equities(risk, horizon, limit, price_range))
         elif asset_class == "crypto":
-            results.extend(screen_crypto(risk, horizon, limit))
+            results.extend(screen_crypto(risk, horizon, limit, price_range))
         elif asset_class == "commodity":
-            results.extend(screen_commodities(risk, horizon, limit))
+            results.extend(screen_commodities(risk, horizon, limit, price_range))
     return results

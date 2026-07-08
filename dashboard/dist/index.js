@@ -362,11 +362,21 @@
     );
   }
 
+  const PRICE_RANGES = [
+    { value: "all", label: "All prices" },
+    { value: "pennies", label: "Pennies (< $5)" },
+    { value: "5_50", label: "$5 – $50" },
+    { value: "51_100", label: "$51 – $100" },
+    { value: "101_300", label: "$101 – $300" },
+    { value: "301_plus", label: "$301+" },
+  ];
+
   function ScreenerPanel(props) {
     const [assetClasses, setAssetClasses] = useState(["stock"]);
     const [risk, setRisk] = useState("medium");
     const [horizon, setHorizon] = useState("position");
     const [limit, setLimit] = useState(10);
+    const [priceRange, setPriceRange] = useState("all");
     const [job, setJob] = useState(null); // { id, status }
     const [results, setResults] = useState([]);
     const [err, setErr] = useState(null);
@@ -382,7 +392,10 @@
 
     function onRunScreen() {
       setErr(null);
-      postScreen({ asset_classes: assetClasses, risk: risk, horizon: horizon, limit: Number(limit) || 10 })
+      postScreen({
+        asset_classes: assetClasses, risk: risk, horizon: horizon,
+        limit: Number(limit) || 10, price_range: priceRange,
+      })
         .then(function (result) {
           setJob({ id: result.job.id, status: result.job.status });
         })
@@ -471,6 +484,14 @@
             h("select", { value: horizon, onChange: function (e) { setHorizon(e.target.value); } },
               h("option", { value: "swing" }, "Swing (a few days)"),
               h("option", { value: "position" }, "Hold (6 months)"),
+            ),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, null, "Price"),
+            h("select", { value: priceRange, onChange: function (e) { setPriceRange(e.target.value); } },
+              PRICE_RANGES.map(function (p) {
+                return h("option", { key: p.value, value: p.value }, p.label);
+              }),
             ),
           ),
           h("div", { className: "flex flex-col gap-1" },

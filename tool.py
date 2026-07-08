@@ -300,7 +300,9 @@ def run_batch(tickers: List[str], trade_date: str | None = None, horizon: str | 
     return _persist_and_summarize(payload)
 
 
-def run_screen(asset_classes: List[str], risk: str, horizon: str, limit: int = 20) -> list[dict]:
+def run_screen(
+    asset_classes: List[str], risk: str, horizon: str, limit: int = 20, price_range: str = "all",
+) -> list[dict]:
     """Stage A: cheap candidate discovery, no TradingAgents deep-dive.
 
     Tries the native in-process screener first (no subprocess); falls back
@@ -314,7 +316,7 @@ def run_screen(asset_classes: List[str], risk: str, horizon: str, limit: int = 2
 
     if diag["path"] == "native":
         try:
-            return screener.discover(asset_classes, risk, horizon, limit)
+            return screener.discover(asset_classes, risk, horizon, limit, price_range)
         except Exception as exc:  # noqa: BLE001
             raise TradingAgentsRunError(f"Native screener failed: {type(exc).__name__}: {exc}")
 
@@ -327,6 +329,7 @@ def run_screen(asset_classes: List[str], risk: str, horizon: str, limit: int = 2
         "--risk", risk,
         "--horizon", horizon,
         "--limit", str(limit),
+        "--price-range", price_range,
     ]
     if mode == "docker":
         cmd = [
@@ -370,7 +373,7 @@ def run_screen(asset_classes: List[str], risk: str, horizon: str, limit: int = 2
 
 def run_screen_and_analyze(
     asset_classes: List[str], risk: str, horizon: str, limit: int, trade_date: str | None = None,
-    on_candidates: "Callable[[list[dict]], None] | None" = None,
+    on_candidates: "Callable[[list[dict]], None] | None" = None, price_range: str = "all",
 ) -> dict:
     """Stage A (discovery) + stage B (TradingAgents deep dive on the
     shortlist), the full tradingagents_screen pipeline.
@@ -382,7 +385,7 @@ def run_screen_and_analyze(
     can be shown as busy elsewhere in the UI (e.g. the watchlist's per-ticker
     Run buttons) instead of only the screen job itself looking busy.
     """
-    candidates = run_screen(asset_classes, risk, horizon, limit)
+    candidates = run_screen(asset_classes, risk, horizon, limit, price_range)
     tickers = [c["ticker"] for c in candidates if c.get("ticker")]
     by_ticker = {c["ticker"]: c for c in candidates if c.get("ticker")}
 
@@ -401,6 +404,7 @@ def run_screen_and_analyze(
     try:
         store.save_screen_run({
             "asset_classes": asset_classes, "risk": risk, "horizon": horizon,
+            "price_range": price_range,
             "date": analysis.get("date"), "results": enriched, "created_at": int(time.time()),
         })
     except Exception:
@@ -416,9 +420,12 @@ def _handle_tradingagents_screen(args: dict, **kw) -> str:
     risk = str(args.get("risk") or "medium").strip().lower()
     horizon = str(args.get("horizon") or "position").strip().lower()
     limit = int(args.get("limit") or 10)
+    price_range = str(args.get("price_range") or "all").strip().lower()
     trade_date = str(args.get("date") or "").strip() or None
     try:
-        result = run_screen_and_analyze(asset_classes, risk, horizon, limit, trade_date)
+        result = run_screen_and_analyze(
+            asset_classes, risk, horizon, limit, trade_date, price_range=price_range,
+        )
     except TradingAgentsRunError as exc:
         return tool_error(str(exc), **exc.extra)
     except ValueError as exc:
@@ -516,6 +523,14 @@ TRADINGAGENTS_SCREEN_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": "Max candidates per asset class to shortlist for deep-dive analysis. Defaults to 10.",
+            },
+            "price_range": {
+                "type": "string",
+                "enum": ["all", "pennies", "5_50", "51_100", "101_300", "301_plus"],
+                "description": (
+                    "Price filter: \"all\", \"pennies\" (under $5), \"5_50\", \"51_100\", "
+                    "\"101_300\", or \"301_plus\". Defaults to \"all\"."
+                ),
             },
             "date": {
                 "type": "string",
