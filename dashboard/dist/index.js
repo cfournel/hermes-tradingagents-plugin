@@ -239,6 +239,7 @@
           onChange: function (e) { setText(e.target.value); },
         }),
         err ? h("div", { className: "text-xs text-destructive" }, err) : null,
+        props.cronErr ? h("div", { className: "text-xs text-destructive" }, props.cronErr) : null,
         h("div", { className: "flex items-center gap-2" },
           h(Button, {
             size: "sm",
@@ -246,6 +247,31 @@
             onClick: onSave,
           }, saving ? "Saving…" : "Save watchlist"),
           dirty ? h("span", { className: "text-xs text-muted-foreground" }, "Unsaved changes") : null,
+          h("select", {
+            value: props.cronFrequency,
+            disabled: props.cronBusy || (props.cronJob && props.cronJob.exists),
+            onChange: function (e) { props.onCronFrequencyChange(e.target.value); },
+          },
+            CRON_FREQUENCIES.map(function (f) {
+              return h("option", { key: f.value, value: f.value }, f.label);
+            }),
+          ),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            disabled: props.cronBusy || !props.cronJob || props.cronJob.exists,
+            onClick: props.onCreateCron,
+          }, props.cronJob && props.cronJob.exists
+              ? `Scheduled (${props.cronJob.schedule || props.cronFrequency})`
+              : "Schedule watchlist"),
+          (props.cronJob && props.cronJob.exists)
+            ? h(Button, {
+                size: "sm",
+                variant: "outline",
+                disabled: props.cronBusy,
+                onClick: props.onDeleteCron,
+              }, "Remove schedule")
+            : null,
         ),
       ),
     );
@@ -916,37 +942,11 @@
             onClick: onRunAll,
             disabled: anyRunActive || !tickers.length,
           }, allRunActive ? "Running all…" : anyRunActive ? "Analysis running…" : "Run all (queued)"),
-          h("select", {
-            value: watchlistCronFrequency,
-            disabled: watchlistCronBusy || (watchlistCronJob && watchlistCronJob.exists),
-            onChange: function (e) { setWatchlistCronFrequency(e.target.value); },
-          },
-            CRON_FREQUENCIES.map(function (f) {
-              return h("option", { key: f.value, value: f.value }, f.label);
-            }),
-          ),
-          h(Button, {
-            size: "sm",
-            variant: "outline",
-            disabled: watchlistCronBusy || !watchlistCronJob || watchlistCronJob.exists,
-            onClick: onCreateWatchlistCron,
-          }, watchlistCronJob && watchlistCronJob.exists
-              ? `Scheduled (${watchlistCronJob.schedule || watchlistCronFrequency})`
-              : "Schedule watchlist"),
-          (watchlistCronJob && watchlistCronJob.exists)
-            ? h(Button, {
-                size: "sm",
-                variant: "outline",
-                disabled: watchlistCronBusy,
-                onClick: onDeleteWatchlistCron,
-              }, "Remove schedule")
-            : null,
           h(Button, { size: "sm", variant: "outline", onClick: load, disabled: loading },
             loading ? "Loading…" : "Refresh"),
         ),
       ),
       loadErr ? h("div", { className: "text-sm text-destructive" }, loadErr) : null,
-      watchlistCronErr ? h("div", { className: "text-sm text-destructive" }, watchlistCronErr) : null,
       runErr
         ? h("pre", {
             className: "text-sm text-destructive hermes-tradingagents-run-error",
@@ -957,6 +957,13 @@
       h(WatchlistEditor, {
         tickers: tickers,
         onSaved: function (saved) { setTickers(saved); load(); },
+        cronJob: watchlistCronJob,
+        cronFrequency: watchlistCronFrequency,
+        cronBusy: watchlistCronBusy,
+        cronErr: watchlistCronErr,
+        onCronFrequencyChange: setWatchlistCronFrequency,
+        onCreateCron: onCreateWatchlistCron,
+        onDeleteCron: onDeleteWatchlistCron,
       }),
       h(Card, null,
         h(CardHeader, null, h(CardTitle, null, "Last analysis by security")),

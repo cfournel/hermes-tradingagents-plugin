@@ -345,6 +345,11 @@ def run_batch(
     return _persist_and_summarize(payload)
 
 
+def _alpaca_configured() -> bool:
+    env_file = Path(os.environ.get("ALPACA_ENV_FILE", "~/.hermes/secrets/alpaca.env")).expanduser()
+    return bool(os.environ.get("ALPACA_API_KEY")) or env_file.exists()
+
+
 def run_screen(
     asset_classes: List[str], risk: str, horizon: str, limit: int = 20, price_range: str = "all",
 ) -> list[dict]:
@@ -359,7 +364,11 @@ def run_screen(
     if not diag.get("ready"):
         raise TradingAgentsRunError(diag.get("detail") or "Screener is not available.")
 
-    if diag["path"] == "native":
+    # Stocks: the Alpaca-universe screener lives in TradingAgents, so shell out
+    # to it whenever Alpaca credentials are configured (the native Yahoo
+    # screener knows nothing about what is actually tradable).
+    use_alpaca = "stock" in asset_classes and _alpaca_configured()
+    if diag["path"] == "native" and not use_alpaca:
         try:
             return screener.discover(asset_classes, risk, horizon, limit, price_range)
         except Exception as exc:  # noqa: BLE001
